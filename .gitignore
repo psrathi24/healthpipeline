@@ -1,0 +1,10 @@
+venv/
+.venv/
+.env
+*.pyc
+__pycache__/
+.dagster_home/
+.tmp_dagster_home_*/
+output/
+*.jar
+.DS_Store
