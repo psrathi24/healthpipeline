@@ -8,3 +8,5 @@ __pycache__/
 output/
 *.jar
 .DS_Store
+keys/*.pem
+!keys/.gitkeep

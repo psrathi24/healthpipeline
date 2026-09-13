@@ -132,6 +132,7 @@ pip install fastapi uvicorn
 pip install groq
 pip install beautifulsoup4
 pip install mcp
+pip install "passlib[bcrypt]" bcrypt pyotp qrcode pillow PyJWT cryptography email-validator
 ```
 
 ### 4. Configure environment variables
@@ -150,9 +151,40 @@ PGDATABASE=healthpipeline
 PGUSER=your_mac_username
 PGPASSWORD=
 GROQ_API_KEY=your_groq_api_key_here
+
+# Portal Auth
+PORTAL_JWT_PRIVATE_KEY_PATH=keys/portal_private_key.pem
+PORTAL_JWT_PUBLIC_KEY_PATH=keys/portal_public_key.pem
+PORTAL_JWT_ALGORITHM=RS256
+PORTAL_ACCESS_TOKEN_EXPIRE_MINUTES=15
+PORTAL_REFRESH_TOKEN_EXPIRE_DAYS=7
+PORTAL_ENCRYPTION_KEY=       # generate with:
+# python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+PORTAL_COOKIE_DOMAIN=
+PORTAL_COOKIE_SECURE=false
+PORTAL_FRONTEND_URL=http://localhost:3000
+SENDGRID_API_KEY=
+SENDGRID_FROM_EMAIL=noreply@kalamon.cloud
 ```
 
 Get a free Groq API key at [console.groq.com](https://console.groq.com).
+
+Generate a Fernet key for MFA secret encryption:
+
+```bash
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
+Generate portal JWT keys (run once; `keys/` PEM files are gitignored):
+
+```bash
+mkdir -p keys
+openssl genrsa -out keys/portal_private_key.pem 2048
+openssl rsa -in keys/portal_private_key.pem \
+  -pubout -out keys/portal_public_key.pem
+```
+
+These keys are separate from any SMART Backend Services signing key.
 
 ### 5. Set up PostgreSQL database
 
@@ -162,10 +194,20 @@ CREATE DATABASE healthpipeline;
 \q
 ```
 
-Then run the schema:
+Then run the schema (includes provider-portal auth tables):
 
 ```bash
 psql -d healthpipeline -f db/schema.sql
+```
+
+Create a local portal user (password min 12 chars with mixed case, number, and symbol):
+
+```bash
+python db/seed_portal_user.py \
+  --email admin@kalamon.cloud \
+  --password 'ChangeMe!2026aa' \
+  --name 'Practice Admin' \
+  --role admin
 ```
 
 ### 6. Seed X12 denial code mappings
@@ -227,8 +269,21 @@ Base URL: `http://localhost:8000`
 | GET | `/health` | Health check |
 | GET | `/denial/{claim_id}` | Get one denial record by claim ID |
 | GET | `/denials` | List recent denial records (params: `limit`, `status`) |
+| POST | `/auth/login` | Email/password login; httpOnly access + refresh cookies |
+| POST | `/auth/mfa/verify` | Verify TOTP and issue session cookies |
+| POST | `/auth/mfa/setup` | Generate pending TOTP secret + QR URI |
+| POST | `/auth/mfa/confirm` | Confirm TOTP and persist encrypted MFA secret |
+| POST | `/auth/refresh` | Rotate access token from refresh cookie |
+| POST | `/auth/logout` | Revoke session and clear cookies |
+| POST | `/auth/forgot-password` | Request reset email (always 200) |
+| POST | `/auth/reset-password` | Consume reset token and set new password |
+| GET | `/auth/me` | Current user profile (no token in body) |
+| GET | `/auth/sessions` | List this user's active sessions |
+| DELETE | `/auth/sessions/{session_id}` | Revoke a specific session |
 
 Interactive docs available at [http://localhost:8000/docs](http://localhost:8000/docs).
+
+Access and refresh tokens are httpOnly, Secure (production), SameSite=strict cookies. They are never returned in JSON except a short-lived `temp_token` when MFA is required.
 
 ---
 
@@ -291,6 +346,10 @@ python api/run_mcp.py
 | `quarantine_records` | Records that failed required field validation |
 | `extraction_log` | Run history for the extraction layer |
 | `code_mappings` | X12 CARC denial code lookup table (~300 active codes) |
+| `portal_users` | Provider portal accounts, roles, MFA, lockout |
+| `portal_sessions` | Hashed refresh tokens / device sessions |
+| `portal_audit_log` | HIPAA-oriented auth event log |
+| `password_reset_tokens` | One-time password reset tokens |
 
 ---
 
@@ -308,7 +367,7 @@ python api/run_mcp.py
 
 - **Synthea data lacks denial codes** — Synthea generates mostly paid claims. Real payer data will populate `denial_reason_code`, `diagnosis_codes`, and `payer_name` fields that appear null here.
 - **Local only** — pipeline runs locally against a local PostgreSQL instance. Production deployment would require cloud PostgreSQL, hosted Dagster, and a deployed FastAPI instance.
-- **No authentication** — the API has no auth layer. Production would require OAuth2 or API key authentication.
+- **Portal auth is RS256 cookie-based** — denial list endpoints remain unauthenticated for the pipeline PoC; the provider portal uses `/auth/*` with RBAC. Production should also protect `/denial*` routes.
 - **Single resource type** — currently extracts ExplanationOfBenefit only. Real pipeline would add Claim, ClaimResponse, Patient, and Coverage resources.
 
 ---

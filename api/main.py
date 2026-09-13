@@ -15,9 +15,11 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from psycopg2.extras import RealDictCursor
 
+from .auth_router import auth_router
 from .models import DenialRecord
 
 _HEALTHPIPELINE_ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(_HEALTHPIPELINE_ROOT / ".env")
 
 _DENIAL_COLUMNS = """
     claim_id,
@@ -36,8 +38,25 @@ _DENIAL_COLUMNS = """
 """
 
 
+def _cors_origins() -> list[str]:
+    origins = {
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "https://kalamon.cloud",
+        "https://www.kalamon.cloud",
+    }
+    frontend = os.environ.get("PORTAL_FRONTEND_URL", "").rstrip("/")
+    if frontend:
+        origins.add(frontend)
+    extra = os.environ.get("PORTAL_CORS_ORIGINS", "")
+    for origin in extra.split(","):
+        origin = origin.strip().rstrip("/")
+        if origin:
+            origins.add(origin)
+    return sorted(origins)
+
+
 def _connect_db() -> psycopg2.extensions.connection:
-    load_dotenv(_HEALTHPIPELINE_ROOT / ".env")
     return psycopg2.connect(
         host=os.environ.get("PGHOST", "localhost"),
         port=os.environ.get("PGPORT", "5432"),
@@ -65,11 +84,13 @@ app = FastAPI(title="Health Pipeline Denial API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(auth_router, prefix="/auth")
 
 
 def _get_db(request: Request) -> psycopg2.extensions.connection:

@@ -1,0 +1,8 @@
+passlib[bcrypt]
+bcrypt
+pyotp
+qrcode
+pillow
+PyJWT
+cryptography
+email-validator
