@@ -17,6 +17,7 @@ from psycopg2.extras import RealDictCursor
 
 from .auth_router import auth_router
 from .models import DenialRecord
+from .serve_router import audit_router, serve_router
 
 _HEALTHPIPELINE_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(_HEALTHPIPELINE_ROOT / ".env")
@@ -91,6 +92,8 @@ app.add_middleware(
 )
 
 app.include_router(auth_router, prefix="/auth")
+app.include_router(serve_router, prefix="/serve")
+app.include_router(audit_router, prefix="/audit")
 
 
 def _get_db(request: Request) -> psycopg2.extensions.connection:
