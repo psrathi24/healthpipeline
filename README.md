@@ -79,7 +79,8 @@ healthpipeline/
 │   ├── __init__.py
 │   ├── main.py                 # FastAPI app and endpoints
 │   ├── models.py               # Pydantic response models
-│   └── db.py                   # DB connection for API
+│   ├── mcp_server.py           # MCP tools and resources (Anthropic MCP SDK)
+│   └── run_mcp.py              # MCP server entry point
 ├── db/
 │   ├── schema.sql              # PostgreSQL table definitions
 │   ├── db_client.py            # DB connection helpers
@@ -130,6 +131,7 @@ pip install dagster dagster-webserver
 pip install fastapi uvicorn
 pip install groq
 pip install beautifulsoup4
+pip install mcp
 ```
 
 ### 4. Configure environment variables
@@ -227,6 +229,31 @@ Base URL: `http://localhost:8000`
 | GET | `/denials` | List recent denial records (params: `limit`, `status`) |
 
 Interactive docs available at [http://localhost:8000/docs](http://localhost:8000/docs).
+
+---
+
+## MCP server
+
+The pipeline is also exposed as a [Model Context Protocol](https://modelcontextprotocol.io) server so agents can call tools instead of HTTP.
+
+From `healthpipeline`:
+
+```bash
+python api/run_mcp.py
+```
+
+| Tool | Purpose |
+|------|---------|
+| `get_denial_context` | Full `DenialContext` row for a claim ID |
+| `list_pending_denials` | Unworked denials, sorted by appeal deadline |
+| `record_outcome` | Insert an appeal outcome for ROI tracking |
+| `get_workflow_rules` | Active payer / validation / escalation rules |
+| `get_pipeline_health` | Last extraction run and data-quality counts |
+
+| Resource | Purpose |
+|----------|---------|
+| `kalamon://workflow/prior-auth-denial` | Prior auth denial workflow rules as operational text |
+| `kalamon://schema/denial-context` | DenialContext field and flag documentation |
 
 **Example response — `GET /denial/{claim_id}`:**
 
