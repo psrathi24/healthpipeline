@@ -134,3 +134,63 @@ CREATE INDEX IF NOT EXISTS idx_denial_outcomes_claim
   ON denial_outcomes(claim_id);
 CREATE INDEX IF NOT EXISTS idx_vendor_connections_client
   ON portal_vendor_connections(client_id) WHERE is_active = TRUE;
+
+ALTER TABLE workflow_rules
+  ADD COLUMN IF NOT EXISTS editable_by_provider BOOLEAN DEFAULT FALSE;
+
+ALTER TABLE denial_contexts
+  ADD COLUMN IF NOT EXISTS needs_reprocessing BOOLEAN DEFAULT FALSE;
+
+ALTER TABLE quarantine_records
+  ADD COLUMN IF NOT EXISTS workflow TEXT DEFAULT 'prior_auth_denial',
+  ADD COLUMN IF NOT EXISTS claim_id TEXT,
+  ADD COLUMN IF NOT EXISTS reviewed_by UUID REFERENCES portal_users(id),
+  ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMPTZ,
+  ADD COLUMN IF NOT EXISTS review_action TEXT
+    CHECK (review_action IN ('approved', 'dismissed')),
+  ADD COLUMN IF NOT EXISTS override_reason TEXT;
+
+CREATE TABLE IF NOT EXISTS payer_name_mappings (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    client_id TEXT,
+    raw_name TEXT NOT NULL,
+    canonical_name TEXT NOT NULL,
+    canonical_payer_id TEXT,
+    source TEXT DEFAULT 'auto',
+    validated_by_provider BOOLEAN DEFAULT FALSE,
+    validated_at TIMESTAMPTZ,
+    validated_by UUID REFERENCES portal_users(id),
+    confidence_score NUMERIC(3, 2) DEFAULT 1.0,
+    active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_payer_mappings_global
+  ON payer_name_mappings (raw_name) WHERE client_id IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_payer_mappings_client
+  ON payer_name_mappings (client_id, raw_name) WHERE client_id IS NOT NULL;
+
+INSERT INTO payer_name_mappings
+  (raw_name, canonical_name, source, validated_by_provider, confidence_score)
+VALUES
+  ('UHC', 'UnitedHealthcare', 'auto', TRUE, 1.00),
+  ('BCBS', 'Blue Cross Blue Shield', 'auto', TRUE, 0.80),
+  ('BCBSCA', 'Blue Cross Blue Shield of California', 'auto', TRUE, 0.90),
+  ('Anthem', 'Anthem Blue Cross', 'auto', TRUE, 0.85),
+  ('Aetna', 'Aetna', 'auto', TRUE, 1.00),
+  ('Cigna', 'Cigna Health', 'auto', TRUE, 1.00),
+  ('Humana', 'Humana', 'auto', TRUE, 1.00),
+  ('Medicare', 'Medicare', 'auto', TRUE, 1.00),
+  ('Medicaid', 'Medicaid', 'auto', TRUE, 1.00),
+  ('Tricare', 'TRICARE', 'auto', TRUE, 1.00),
+  ('KPNC', 'Kaiser Permanente Northern California', 'auto', TRUE, 0.90),
+  ('KP', 'Kaiser Permanente', 'auto', TRUE, 0.75),
+  ('MO_BCBS', 'Molina Healthcare', 'auto', FALSE, 0.60),
+  ('CHP', 'Community Health Plan', 'auto', FALSE, 0.50)
+ON CONFLICT (raw_name) WHERE client_id IS NULL DO NOTHING;
+
+UPDATE quarantine_records
+SET
+  claim_id = COALESCE(claim_id, record->>'claim_id'),
+  workflow = COALESCE(workflow, 'prior_auth_denial')
+WHERE claim_id IS NULL OR workflow IS NULL;
