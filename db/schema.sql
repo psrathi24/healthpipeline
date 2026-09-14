@@ -194,3 +194,111 @@ SET
   claim_id = COALESCE(claim_id, record->>'claim_id'),
   workflow = COALESCE(workflow, 'prior_auth_denial')
 WHERE claim_id IS NULL OR workflow IS NULL;
+
+ALTER TABLE denial_contexts
+  ADD COLUMN IF NOT EXISTS ordering_provider_npi TEXT,
+  ADD COLUMN IF NOT EXISTS needs_review BOOLEAN DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS review_reason TEXT,
+  ADD COLUMN IF NOT EXISTS manual_ready_override BOOLEAN DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS override_note TEXT,
+  ADD COLUMN IF NOT EXISTS override_by UUID REFERENCES portal_users(id),
+  ADD COLUMN IF NOT EXISTS override_at TIMESTAMPTZ;
+
+CREATE INDEX IF NOT EXISTS idx_denial_contexts_readiness
+  ON denial_contexts(validation_status, assembled_at);
+
+CREATE TABLE IF NOT EXISTS package_requirement_templates (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    client_id TEXT,
+    workflow TEXT NOT NULL,
+    payer_name TEXT,
+    procedure_code TEXT,
+    procedure_description TEXT,
+    source TEXT DEFAULT 'system',
+    active BOOLEAN DEFAULT TRUE,
+    created_by UUID REFERENCES portal_users(id),
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_package_templates_scope
+  ON package_requirement_templates (
+    COALESCE(client_id, ''),
+    workflow,
+    COALESCE(payer_name, ''),
+    COALESCE(procedure_code, '')
+  );
+
+CREATE TABLE IF NOT EXISTS package_checklist_items (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    template_id UUID REFERENCES package_requirement_templates(id) ON DELETE CASCADE,
+    label TEXT NOT NULL,
+    description TEXT,
+    field_source TEXT,
+    required BOOLEAN DEFAULT TRUE,
+    sort_order INTEGER DEFAULT 0,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS package_manual_checks (
+    claim_id TEXT NOT NULL,
+    item_id UUID NOT NULL REFERENCES package_checklist_items(id) ON DELETE CASCADE,
+    confirmed_by UUID REFERENCES portal_users(id),
+    confirmed_at TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (claim_id, item_id)
+);
+
+INSERT INTO package_requirement_templates (workflow, payer_name, procedure_code, source)
+SELECT 'prior_auth_denial', NULL, NULL, 'system'
+WHERE NOT EXISTS (
+    SELECT 1 FROM package_requirement_templates
+    WHERE workflow = 'prior_auth_denial'
+      AND payer_name IS NULL
+      AND procedure_code IS NULL
+      AND client_id IS NULL
+);
+
+INSERT INTO package_checklist_items (template_id, label, description, field_source, required, sort_order)
+SELECT t.id, v.label, v.description, v.field_source, v.required, v.sort_order
+FROM package_requirement_templates t
+CROSS JOIN (
+    VALUES
+      ('Claim identifier', 'Required to link this record to billing and EHR systems.', 'claim_id', TRUE, 0),
+      ('Patient identifier', 'Required to associate the case with the patient chart.', 'patient_id', TRUE, 1),
+      ('Member ID', 'Payer member identifier from coverage data.', 'member_id', TRUE, 2),
+      ('Service date', 'Used to calculate appeal deadline and medical necessity window.', 'service_date', TRUE, 3),
+      ('Procedure code', 'CPT/HCPCS that was denied and needs authorization.', 'procedure_codes', TRUE, 4),
+      ('Payer name', 'Canonical payer used to apply appeal rules.', 'payer_name', TRUE, 5),
+      ('Appeal deadline', 'Hard filing deadline for this payer.', 'payer_appeal_deadline', TRUE, 6),
+      ('Denial reason code', 'Adjustment/reason code from EOB or ERA.', 'denial_reason_code', FALSE, 7),
+      ('Diagnosis codes', 'ICD-10 codes supporting medical necessity.', 'diagnosis_codes', FALSE, 8),
+      ('Clinical notes', 'Visit notes or medical necessity narrative.', 'clinical_notes_summary', FALSE, 9),
+      ('Ordering provider NPI', 'Confirm the ordering provider on the original request.', 'provider_npi', FALSE, 10),
+      ('Appeal requirements', 'Payer-specific documents required with the submission.', 'appeal_requirements', FALSE, 11),
+      ('Conservative treatment documented', 'Staff must confirm conservative care is documented in the chart.', NULL, TRUE, 12)
+) AS v(label, description, field_source, required, sort_order)
+WHERE t.workflow = 'prior_auth_denial'
+  AND t.payer_name IS NULL
+  AND t.procedure_code IS NULL
+  AND t.client_id IS NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM package_checklist_items i WHERE i.template_id = t.id
+  );
+
+INSERT INTO package_checklist_items (template_id, label, description, field_source, required, sort_order)
+SELECT t.id,
+       'Conservative treatment documented',
+       'Staff must confirm conservative care is documented in the chart.',
+       NULL,
+       TRUE,
+       12
+FROM package_requirement_templates t
+WHERE t.workflow = 'prior_auth_denial'
+  AND t.payer_name IS NULL
+  AND t.procedure_code IS NULL
+  AND t.client_id IS NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM package_checklist_items i
+      WHERE i.template_id = t.id
+        AND i.label = 'Conservative treatment documented'
+  );
