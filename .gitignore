@@ -6,6 +6,7 @@ __pycache__/
 .dagster_home/
 .tmp_dagster_home_*/
 output/
+uploads/
 *.jar
 .DS_Store
 keys/*.pem

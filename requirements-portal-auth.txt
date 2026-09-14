@@ -6,3 +6,4 @@ pillow
 PyJWT
 cryptography
 email-validator
+python-multipart

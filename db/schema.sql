@@ -302,3 +302,66 @@ WHERE t.workflow = 'prior_auth_denial'
       WHERE i.template_id = t.id
         AND i.label = 'Conservative treatment documented'
   );
+
+CREATE TABLE IF NOT EXISTS portal_clients (
+    id TEXT PRIMARY KEY,
+    practice_name TEXT,
+    baa_acknowledged_at TIMESTAMPTZ,
+    baa_acknowledged_by UUID REFERENCES portal_users(id),
+    payer_mappings_reviewed_at TIMESTAMPTZ,
+    onboarding_complete_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+INSERT INTO portal_clients (id, practice_name)
+SELECT DISTINCT client_id, 'Demo Practice'
+FROM portal_users
+WHERE client_id IS NOT NULL
+ON CONFLICT (id) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS portal_connector_connections (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    client_id TEXT NOT NULL,
+    connector_type TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    category TEXT NOT NULL,
+    auth_method TEXT NOT NULL,
+    encrypted_credentials TEXT,
+    workflows TEXT[] NOT NULL DEFAULT '{}',
+    custom_instructions TEXT,
+    notify_on_failure BOOLEAN DEFAULT FALSE,
+    notify_email TEXT,
+    active BOOLEAN DEFAULT TRUE,
+    last_tested_at TIMESTAMPTZ,
+    last_test_success BOOLEAN,
+    last_test_error TEXT,
+    last_successful_run_at TIMESTAMPTZ,
+    disconnected_at TIMESTAMPTZ,
+    disconnected_reason TEXT,
+    created_by UUID REFERENCES portal_users(id),
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_portal_connectors_active
+  ON portal_connector_connections (client_id, connector_type)
+  WHERE active = TRUE;
+
+CREATE TABLE IF NOT EXISTS file_upload_jobs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    client_id TEXT NOT NULL,
+    connection_id UUID REFERENCES portal_connector_connections(id),
+    original_filename TEXT NOT NULL,
+    storage_path TEXT NOT NULL,
+    file_type TEXT NOT NULL,
+    workflow TEXT NOT NULL,
+    description TEXT,
+    file_size_bytes BIGINT,
+    status TEXT DEFAULT 'processing'
+      CHECK (status IN ('processing','complete','failed')),
+    records_extracted INTEGER,
+    error_message TEXT,
+    uploaded_by UUID REFERENCES portal_users(id),
+    uploaded_at TIMESTAMPTZ DEFAULT NOW(),
+    completed_at TIMESTAMPTZ
+);
