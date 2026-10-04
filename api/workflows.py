@@ -4,13 +4,13 @@ from __future__ import annotations
 
 WORKFLOW_DENIAL = "prior_auth_denial"
 WORKFLOW_COMPLETENESS = "prior_auth_completeness"
-WORKFLOW_DEFAULT = WORKFLOW_DENIAL
+WORKFLOW_DEFAULT = WORKFLOW_COMPLETENESS
 
-LIVE_WORKFLOWS = (WORKFLOW_COMPLETENESS, WORKFLOW_DENIAL)
+LIVE_WORKFLOWS = (WORKFLOW_COMPLETENESS,)
 
 
 def is_completeness(workflow: str | None) -> bool:
-    return (workflow or "") == WORKFLOW_COMPLETENESS
+    return (workflow or WORKFLOW_DEFAULT) == WORKFLOW_COMPLETENESS
 
 
 def case_table(workflow: str | None) -> str:

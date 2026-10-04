@@ -644,28 +644,19 @@ def _run_extractor_job(workflow: str = WORKFLOW_DEFAULT) -> None:
     for path in (extractors_dir, transformers_dir, str(_ROOT)):
         if path not in sys.path:
             sys.path.insert(0, path)
-    if is_completeness(workflow):
-        from order_extractor import OrderExtractor  # type: ignore
-        from completeness_transformer import CompletenessTransformer  # type: ignore
+    from order_extractor import OrderExtractor  # type: ignore
+    from completeness_transformer import CompletenessTransformer  # type: ignore
 
-        extractor = OrderExtractor()
-        try:
-            extractor.run()
-        finally:
-            extractor.close()
-        transformer = CompletenessTransformer()
-        try:
-            transformer.run()
-        finally:
-            transformer.close()
-        return
-    from eob_extractor import EOBExtractor  # type: ignore
-
-    extractor = EOBExtractor()
+    extractor = OrderExtractor()
     try:
         extractor.run()
     finally:
         extractor.close()
+    transformer = CompletenessTransformer()
+    try:
+        transformer.run()
+    finally:
+        transformer.close()
 
 
 @serve_router.post("/manual-run")
@@ -689,7 +680,7 @@ def manual_run(
         )
         row = cur.fetchone()
     conn.commit()
-    workflow = body.workflow or WORKFLOW_DEFAULT
+    workflow = WORKFLOW_COMPLETENESS
     try:
         background.add_task(_run_extractor_job, workflow)
     except Exception:

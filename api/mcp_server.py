@@ -1,7 +1,5 @@
 """
-Kalamon MCP server: expose the healthcare denial pipeline as MCP tools and resources.
-
-Uses Anthropic's open-source Python MCP SDK (MCPServer / @mcp.tool / @mcp.resource).
+Kalamon MCP server: expose the prior-auth completeness pipeline as MCP tools.
 """
 
 from __future__ import annotations
@@ -9,10 +7,10 @@ from __future__ import annotations
 import json
 import os
 from contextlib import contextmanager
-from datetime import date, datetime, timezone
+from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Annotated, Any, Iterator, Literal
+from typing import Annotated, Any, Iterator
 
 import psycopg2
 from dotenv import load_dotenv
@@ -23,16 +21,14 @@ from pydantic import Field
 
 _HEALTHPIPELINE_ROOT = Path(__file__).resolve().parent.parent
 
-AppealMethod = Literal["agent_generated", "manual", "hybrid"]
-AppealOutcome = Literal["approved", "denied", "pending", "escalated"]
-
 mcp = MCPServer(
     name="kalamon",
     instructions=(
-        "Kalamon healthcare data pipeline. Primary live workflow is prior-auth "
-        "completeness (DTR-shaped pre-submit packets). Denial contexts remain available "
-        "as a secondary workflow. Load workflow rules, retrieve completeness packets or "
-        "denial contexts, list pending cases, and record appeal outcomes for denials."
+        "Kalamon healthcare data pipeline. The live workflow is prior-auth "
+        "completeness: DTR-shaped pre-submit packets assembled from orders, "
+        "coverage, notes, and payer criteria. Load workflow rules, retrieve "
+        "completeness packets, and list packets still missing evidence. This is "
+        "not PAS submit, not UM approve/deny, and not appeal-letter drafting."
     ),
 )
 
@@ -85,36 +81,6 @@ def _error(message: str) -> str:
 
 def _as_dict(row: Any) -> dict[str, Any]:
     return dict(row) if row is not None else {}
-
-
-@mcp.tool(
-    description=(
-        "Retrieve a complete, validated denial context record for a specific claim. "
-        "Returns assembled denial reason, clinical evidence, payer requirements, "
-        "appeal deadline, and data quality flags."
-    )
-)
-def get_denial_context(
-    claim_id: Annotated[str, Field(description="The claim ID to retrieve")],
-) -> str:
-    try:
-        with _db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                """
-                SELECT *
-                FROM denial_contexts
-                WHERE claim_id = %s
-                """,
-                (claim_id,),
-            )
-            row = cur.fetchone()
-        logger.info("get_denial_context claim_id={} rows={}", claim_id, 1 if row else 0)
-        if row is None:
-            return _error(f"No denial context found for claim_id={claim_id!r}")
-        return _dumps(_as_dict(row))
-    except psycopg2.Error as exc:
-        logger.exception("get_denial_context failed claim_id={}", claim_id)
-        return _error(f"Database error retrieving denial context: {exc}")
 
 
 @mcp.tool(
@@ -201,178 +167,16 @@ def list_pending_auth_packets(
 
 @mcp.tool(
     description=(
-        "List all unworked prior auth denials sorted by appeal deadline urgency. "
-        "Returns cases needing agent action, prioritized by days remaining before "
-        "payer deadline."
-    )
-)
-def list_pending_denials(
-    limit: Annotated[int, Field(description="Max records to return")] = 20,
-    payer_name: Annotated[
-        str | None, Field(description="Filter by specific payer name")
-    ] = None,
-    status: Annotated[
-        str | None,
-        Field(description="Filter by validation_status: clean, flagged"),
-    ] = None,
-) -> str:
-    limit = max(1, min(int(limit), 500))
-    clauses = [
-        """NOT EXISTS (
-            SELECT 1 FROM denial_outcomes o WHERE o.claim_id = dc.claim_id
-        )"""
-    ]
-    params: list[Any] = []
-    if payer_name:
-        clauses.append("dc.payer_name = %s")
-        params.append(payer_name)
-    if status:
-        clauses.append("dc.validation_status = %s")
-        params.append(status)
-    where_sql = " AND ".join(clauses)
-    params.append(limit)
-
-    try:
-        with _db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                f"""
-                SELECT
-                    dc.*,
-                    CASE
-                        WHEN dc.payer_appeal_deadline IS NULL THEN NULL
-                        ELSE (dc.payer_appeal_deadline - CURRENT_DATE)
-                    END AS days_until_deadline
-                FROM denial_contexts dc
-                WHERE {where_sql}
-                ORDER BY dc.payer_appeal_deadline ASC NULLS LAST, dc.assembled_at DESC
-                LIMIT %s
-                """,
-                params,
-            )
-            rows = [_as_dict(row) for row in cur.fetchall()]
-        logger.info(
-            "list_pending_denials limit={} payer_name={} status={} rows={}",
-            limit,
-            payer_name,
-            status,
-            len(rows),
-        )
-        return _dumps(rows)
-    except psycopg2.Error as exc:
-        logger.exception(
-            "list_pending_denials failed limit={} payer_name={} status={}",
-            limit,
-            payer_name,
-            status,
-        )
-        return _error(f"Database error listing pending denials: {exc}")
-
-
-@mcp.tool(
-    description=(
-        "Record the result of an agent action on a denial — whether an appeal was "
-        "filed, the outcome, and time taken. Used to track ROI and build the case study."
-    )
-)
-def record_outcome(
-    claim_id: Annotated[str, Field(description="The claim ID this outcome belongs to")],
-    appeal_filed: Annotated[bool, Field(description="Whether an appeal was filed")],
-    appeal_method: Annotated[
-        AppealMethod,
-        Field(description="How the appeal was produced: agent_generated, manual, hybrid"),
-    ],
-    appeal_outcome: Annotated[
-        AppealOutcome,
-        Field(description="Appeal result: approved, denied, pending, escalated"),
-    ],
-    staff_minutes_saved: Annotated[
-        float | None, Field(description="Staff minutes saved by the agent action")
-    ] = None,
-    amount_recovered: Annotated[
-        float | None, Field(description="Dollar amount recovered from the appeal")
-    ] = None,
-    agent_used: Annotated[
-        str | None, Field(description="Name of the agent that handled this denial")
-    ] = None,
-) -> str:
-    filed_at = datetime.now(timezone.utc) if appeal_filed else None
-    try:
-        with _db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                "SELECT 1 FROM denial_contexts WHERE claim_id = %s",
-                (claim_id,),
-            )
-            if cur.fetchone() is None:
-                logger.info("record_outcome claim_id={} rows=0 (claim not found)", claim_id)
-                return _error(
-                    f"Cannot record outcome: no denial context for claim_id={claim_id!r}"
-                )
-            cur.execute(
-                """
-                INSERT INTO denial_outcomes (
-                    claim_id,
-                    appeal_filed_at,
-                    appeal_method,
-                    appeal_outcome,
-                    staff_minutes_saved,
-                    amount_recovered,
-                    agent_used
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-                RETURNING
-                    id,
-                    claim_id,
-                    appeal_filed_at,
-                    appeal_method,
-                    appeal_outcome,
-                    staff_minutes_saved,
-                    amount_recovered,
-                    agent_used,
-                    created_at
-                """,
-                (
-                    claim_id,
-                    filed_at,
-                    appeal_method,
-                    appeal_outcome,
-                    staff_minutes_saved,
-                    amount_recovered,
-                    agent_used,
-                ),
-            )
-            row = _as_dict(cur.fetchone())
-        row["appeal_filed"] = appeal_filed
-        logger.info(
-            "record_outcome claim_id={} appeal_filed={} method={} outcome={} rows=1",
-            claim_id,
-            appeal_filed,
-            appeal_method,
-            appeal_outcome,
-        )
-        return _dumps(
-            {
-                "status": "ok",
-                "message": "Appeal outcome recorded",
-                "outcome": row,
-            }
-        )
-    except psycopg2.Error as exc:
-        logger.exception("record_outcome failed claim_id={}", claim_id)
-        return _error(f"Database error recording outcome: {exc}")
-
-
-@mcp.tool(
-    description=(
         "Retrieve the active workflow rules and payer configuration for a specific "
-        "workflow. This is the operational context — payer appeal windows, required "
-        "fields, escalation thresholds — that agents should load before acting on denials."
+        "workflow. This is the operational context — required fields and payer criteria "
+        "that agents should load before assembling or serving a completeness packet."
     )
 )
 def get_workflow_rules(
     workflow: Annotated[
         str,
         Field(description="Workflow name to retrieve rules for"),
-    ] = "prior_auth_denial",
+    ] = "prior_auth_completeness",
     client_id: Annotated[
         str | None,
         Field(description="Client-specific rules. Omit for default rules."),
@@ -480,7 +284,7 @@ def get_pipeline_health() -> str:
                 SELECT
                     COUNT(*) FILTER (WHERE validation_status = 'clean') AS records_clean,
                     COUNT(*) FILTER (WHERE validation_status = 'flagged') AS records_flagged
-                FROM clean_denial_records
+                FROM prior_auth_contexts
                 """
             )
             clean_counts = _as_dict(cur.fetchone())
@@ -525,10 +329,10 @@ def get_pipeline_health() -> str:
 
 def _format_workflow_rules(rows: list[dict[str, Any]]) -> str:
     lines = [
-        "# Prior Auth Denial Workflow Rules",
+        "# Prior Auth Completeness Workflow Rules",
         "",
-        "Operational instructions for agents handling prior authorization denials.",
-        "Load these rules before acting on a denial context.",
+        "Operational instructions for agents assembling pre-submit completeness packets.",
+        "Load these rules before serving a packet. This is not PAS submit and not UM.",
         "",
         f"Active rules: {len(rows)}",
         "",
@@ -539,9 +343,9 @@ def _format_workflow_rules(rows: list[dict[str, Any]]) -> str:
 
     headings = {
         "required_field": "Required fields (quarantine if missing)",
-        "payer_override": "Payer appeal windows",
+        "payer_override": "Payer criteria windows",
         "escalation": "Escalation rules",
-        "code_alias": "Denial code aliases",
+        "code_alias": "Code aliases",
     }
     for rule_type, rules in grouped.items():
         title = headings.get(rule_type, rule_type.replace("_", " ").title())
@@ -560,101 +364,76 @@ def _format_workflow_rules(rows: list[dict[str, Any]]) -> str:
 
 
 @mcp.resource(
-    "kalamon://workflow/prior-auth-denial",
-    name="Prior Auth Denial Workflow Rules",
+    "kalamon://workflow/prior-auth-completeness",
+    name="Prior Auth Completeness Workflow Rules",
     description=(
-        "Complete operational context for the prior authorization denial workflow — "
-        "payer appeal windows, required documentation, X12 denial code categories, "
-        "and escalation rules."
+        "Operational context for the DTR-shaped prior-auth completeness workflow — "
+        "required documentation, local LCD/NCD criteria, and data-quality rules."
     ),
     mime_type="text/plain",
 )
-def prior_auth_denial_workflow() -> str:
+def prior_auth_completeness_workflow() -> str:
     try:
         with _db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
                 """
                 SELECT client_id, workflow, rule_type, rule_config, active
                 FROM workflow_rules
-                WHERE workflow = 'prior_auth_denial'
+                WHERE workflow = 'prior_auth_completeness'
                   AND active = true
                 ORDER BY rule_type, id
                 """
             )
             rows = [_as_dict(row) for row in cur.fetchall()]
-        logger.info("resource prior-auth-denial rows={}", len(rows))
+        logger.info("resource prior-auth-completeness rows={}", len(rows))
         if not rows:
-            return "No active workflow_rules found for workflow='prior_auth_denial'.\n"
+            return "No active workflow_rules found for workflow='prior_auth_completeness'.\n"
         return _format_workflow_rules(rows)
     except psycopg2.Error as exc:
-        logger.exception("resource prior-auth-denial failed")
+        logger.exception("resource prior-auth-completeness failed")
         return f"Database error loading workflow rules: {exc}"
 
 
-DENIAL_CONTEXT_SCHEMA_DOC = """# DenialContext Schema
+COMPLETENESS_PACKET_SCHEMA_DOC = """# CompletenessPacket Schema
 
-Field definitions and data quality flag meanings for denial context records
-served by this pipeline. Agents should treat this as the contract for
-`get_denial_context` and `list_pending_denials`.
+Field definitions and data quality flag meanings for prior-auth completeness
+packets. Agents should treat this as the contract for `get_completeness_packet`
+and `list_pending_auth_packets`. This is a pre-submit completeness record —
+not a PAS submission and not a UM approve/deny decision.
 
 ## Record fields
 
-- claim_id: Unique claim identifier. Required. Primary lookup key.
-- patient_id: Patient identifier from the source FHIR resource.
-- service_date: Date of service on the denied claim.
-- denial_reason_code: Source denial / CARC code as received from the payer.
-- denial_category: Canonical category after X12 mapping (e.g. authorization_required, not_covered).
-- canonical_denial_description: Human-readable description of the mapped denial code.
-- payer_name: Payer responsible for the claim.
-- payer_appeal_deadline: Last date an appeal can be filed, derived from payer appeal windows.
-- appeal_requirements: JSON object of documentation / fields required for a successful appeal.
-- diagnosis_codes: ICD diagnosis codes associated with the claim.
-- procedure_codes: Procedure / service codes associated with the claim.
+- claim_id / order_id: Unique order identifier. Required. Primary lookup key.
+- patient_id: Patient identifier from the source FHIR or order extract.
+- service_date: Planned service date on the order.
+- payer_name: Payer responsible for the order.
+- payer_appeal_deadline: Planned-service due date used for packet urgency.
+- diagnosis_codes: ICD diagnosis codes associated with the order.
+- procedure_codes: Procedure / service codes associated with the order.
 - clinical_notes_summary: Short clinical evidence summary assembled from related documents.
-- total_claim_amount: Billed amount on the claim.
-- prior_submission_history: JSON history of related submissions and extraction runs.
 - data_quality_flags: Array of quality markers. See flag meanings below.
-- validation_status: Pipeline validation result: `clean` or `flagged`. Rejected records are quarantined and are not served here.
-- assembled_at: Timestamp when this denial context was assembled.
-- days_until_deadline: (list_pending_denials only) Whole days remaining until payer_appeal_deadline. Negative means the deadline has passed. Null if no deadline is set.
-
-## validation_status
-
-- clean: Required and optional fields are present. Safe to act on.
-- flagged: Required fields are present, but one or more optional fields are missing or an escalation rule matched. Act with the gaps in mind; do not invent missing clinical facts.
-- rejected: Required fields are missing. These records go to quarantine_records and are not returned as denial contexts.
+- validation_status: Pipeline validation result: `clean` or `flagged`.
+- assembled_at: Timestamp when this completeness packet was assembled.
 
 ## data_quality_flags
 
-Flags are strings of the form `kind:field` (or `kind:detail`).
-
-- missing_required:<field>
-  A required field is empty. The assembler quarantines the record. Agents should not see these on denial_contexts. If one appears, stop and ask a human to review.
-- missing_optional:<field>
-  An optional field is empty (for example denial_reason_code, payer_name, diagnosis_codes). The record is still usable. Do not fabricate the missing value; note the gap in any appeal letter and prefer fields that are present.
-- escalation:<detail>
-  A workflow escalation rule matched (for example denial_category=authorization_required). Treat as higher priority; check appeal_requirements and remaining days until the payer deadline.
-
-## How agents should interpret missing flags
-
-1. missing_required — do not generate an appeal; the record is incomplete for safe action.
-2. missing_optional — generate an appeal only from present evidence; explicitly call out what is unknown.
-3. No flags and validation_status=clean — proceed using workflow rules and appeal_requirements.
+- missing_required:<field> — a required field is empty; the assembler quarantines the record.
+- missing_optional:<field> — an optional field is empty. Do not fabricate the missing value.
+- missing_evidence:<criterion> — a payer-criteria keyword was not found in notes.
 """
 
 
 @mcp.resource(
-    "kalamon://schema/denial-context",
-    name="DenialContext Schema",
+    "kalamon://schema/completeness-packet",
+    name="CompletenessPacket Schema",
     description=(
-        "Field definitions and data quality flag meanings for denial context records "
-        "served by this pipeline."
+        "Field definitions and data quality flag meanings for prior-auth completeness packets."
     ),
     mime_type="text/plain",
 )
-def denial_context_schema() -> str:
-    logger.info("resource denial-context-schema rows=0")
-    return DENIAL_CONTEXT_SCHEMA_DOC
+def completeness_packet_schema() -> str:
+    logger.info("resource completeness-packet-schema rows=0")
+    return COMPLETENESS_PACKET_SCHEMA_DOC
 
 
 if __name__ == "__main__":

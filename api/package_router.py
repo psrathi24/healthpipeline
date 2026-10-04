@@ -840,11 +840,7 @@ def get_agent_preview(
     )
     return {
         "claim_id": claim_id,
-        "mcp_call": (
-            f'get_completeness_packet(order_id="{claim_id}")'
-            if is_completeness(workflow_used)
-            else f'get_denial_context(claim_id="{claim_id}")'
-        ),
+        "mcp_call": f'get_completeness_packet(order_id="{claim_id}")',
         "payload": payload,
         "agent_instructions": instructions,
         "readiness_assessment": {
