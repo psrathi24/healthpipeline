@@ -40,6 +40,7 @@ from pydantic import BaseModel, Field
 
 from .auth_router import get_current_user, log_audit_event
 from .auth_security import hash_token, utcnow
+from .workflows import WORKFLOW_COMPLETENESS, WORKFLOW_DEFAULT, case_table, is_completeness
 
 serve_router = APIRouter(tags=["serve"])
 audit_router = APIRouter(tags=["audit"])
@@ -50,7 +51,6 @@ FORBIDDEN = {
     "message": "You don't have permission to view this.",
 }
 
-WORKFLOW_DEFAULT = "prior_auth_denial"
 SORT_SQL = {
     "deadline_asc": "dc.payer_appeal_deadline ASC NULLS LAST, dc.assembled_at DESC",
     "deadline_desc": "dc.payer_appeal_deadline DESC NULLS LAST, dc.assembled_at DESC",
@@ -198,15 +198,19 @@ def get_worklist(
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
 ) -> dict[str, Any]:
-    del workflow  # denial_contexts are prior-auth only today
+    del user
+    table = case_table(workflow)
     order_sql = SORT_SQL.get(sort, SORT_SQL["deadline_asc"])
     clauses = [
         "dc.assembled_at IS NOT NULL",
         "dc.validation_status IN ('clean', 'flagged')",
-        """NOT EXISTS (
-            SELECT 1 FROM denial_outcomes o WHERE o.claim_id = dc.claim_id
-        )""",
     ]
+    if not is_completeness(workflow):
+        clauses.append(
+            """NOT EXISTS (
+            SELECT 1 FROM denial_outcomes o WHERE o.claim_id = dc.claim_id
+        )"""
+        )
     params: list[Any] = []
     if payer_name:
         clauses.append("dc.payer_name = %s")
@@ -221,7 +225,7 @@ def get_worklist(
     conn = _db(request)
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(
-            f"SELECT COUNT(*) AS total FROM denial_contexts dc WHERE {where_sql}",
+            f"SELECT COUNT(*) AS total FROM {table} dc WHERE {where_sql}",
             params,
         )
         total = int(cur.fetchone()["total"] or 0)
@@ -234,7 +238,6 @@ def get_worklist(
                 dc.procedure_codes,
                 dc.service_date,
                 dc.denial_category,
-                dc.denial_reason_code,
                 dc.payer_appeal_deadline,
                 CASE
                     WHEN dc.payer_appeal_deadline IS NULL THEN NULL
@@ -243,7 +246,7 @@ def get_worklist(
                 dc.validation_status,
                 dc.data_quality_flags,
                 dc.assembled_at
-            FROM denial_contexts dc
+            FROM {table} dc
             WHERE {where_sql}
             ORDER BY {order_sql}
             LIMIT %s OFFSET %s
@@ -252,9 +255,9 @@ def get_worklist(
         )
         rows = cur.fetchall()
         cur.execute(
-            """
+            f"""
             SELECT DISTINCT payer_name
-            FROM denial_contexts
+            FROM {table}
             WHERE payer_name IS NOT NULL AND btrim(payer_name) <> ''
             ORDER BY payer_name
             """
@@ -271,7 +274,7 @@ def get_worklist(
                 "procedure_code": procedures[0] if procedures else None,
                 "service_date": row["service_date"].isoformat() if row.get("service_date") else None,
                 "denial_category": row.get("denial_category"),
-                "denial_reason_code": row.get("denial_reason_code"),
+                "denial_reason_code": None,
                 "payer_appeal_deadline": row["payer_appeal_deadline"].isoformat()
                 if row.get("payer_appeal_deadline")
                 else None,
@@ -294,8 +297,13 @@ def get_case(
     user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
     with _cursor(request) as cur:
-        cur.execute("SELECT * FROM denial_contexts WHERE claim_id = %s LIMIT 1", (claim_id,))
+        cur.execute("SELECT * FROM prior_auth_contexts WHERE claim_id = %s OR order_id = %s LIMIT 1", (claim_id, claim_id))
         row = cur.fetchone()
+        workflow_used = WORKFLOW_COMPLETENESS
+        if not row:
+            cur.execute("SELECT * FROM denial_contexts WHERE claim_id = %s LIMIT 1", (claim_id,))
+            row = cur.fetchone()
+            workflow_used = WORKFLOW_DEFAULT
         if not row:
             raise HTTPException(status_code=404, detail="Case not found")
         cur.execute(
@@ -317,7 +325,7 @@ def get_case(
             WHERE workflow = %s AND active = TRUE
             ORDER BY rule_type, id
             """,
-            (WORKFLOW_DEFAULT,),
+            (workflow_used,),
         )
         rules = [_jsonable(dict(item)) for item in cur.fetchall()]
     log_audit_event(
@@ -630,10 +638,27 @@ def pipeline_health(
     }
 
 
-def _run_extractor_job() -> None:
+def _run_extractor_job(workflow: str = WORKFLOW_DEFAULT) -> None:
     extractors_dir = str(_ROOT / "extractors")
-    if extractors_dir not in sys.path:
-        sys.path.insert(0, extractors_dir)
+    transformers_dir = str(_ROOT / "transformers")
+    for path in (extractors_dir, transformers_dir, str(_ROOT)):
+        if path not in sys.path:
+            sys.path.insert(0, path)
+    if is_completeness(workflow):
+        from order_extractor import OrderExtractor  # type: ignore
+        from completeness_transformer import CompletenessTransformer  # type: ignore
+
+        extractor = OrderExtractor()
+        try:
+            extractor.run()
+        finally:
+            extractor.close()
+        transformer = CompletenessTransformer()
+        try:
+            transformer.run()
+        finally:
+            transformer.close()
+        return
     from eob_extractor import EOBExtractor  # type: ignore
 
     extractor = EOBExtractor()
@@ -664,10 +689,11 @@ def manual_run(
         )
         row = cur.fetchone()
     conn.commit()
+    workflow = body.workflow or WORKFLOW_DEFAULT
     try:
-        background.add_task(_run_extractor_job)
+        background.add_task(_run_extractor_job, workflow)
     except Exception:
-        threading.Thread(target=_run_extractor_job, daemon=True).start()
+        threading.Thread(target=_run_extractor_job, args=(workflow,), daemon=True).start()
     log_audit_event(
         request,
         action="manual_run_triggered",

@@ -27,6 +27,8 @@ for _p in (
 
 from eob_extractor import EOBExtractor  # noqa: E402
 from eob_transformer import EOBTransformer  # noqa: E402
+from order_extractor import OrderExtractor  # noqa: E402
+from completeness_transformer import CompletenessTransformer  # noqa: E402
 
 load_dotenv(_HEALTHPIPELINE_ROOT / ".env")
 
@@ -41,8 +43,8 @@ def _connect():
     )
 
 
-def _latest_extraction_inserted() -> tuple[int, int]:
-    """(records_read, records_inserted) from the latest successful eob_extractor run."""
+def _latest_extraction_inserted(extractor_name: str = "eob_extractor") -> tuple[int, int]:
+    """(records_read, records_inserted) from the latest successful extractor run."""
     sql = """
     SELECT records_read, records_inserted
     FROM extraction_log
@@ -52,7 +54,7 @@ def _latest_extraction_inserted() -> tuple[int, int]:
     """
     with _connect() as conn:
         with conn.cursor() as cur:
-            cur.execute(sql, ("eob_extractor",))
+            cur.execute(sql, (extractor_name,))
             row = cur.fetchone()
     if not row:
         return 0, 0
@@ -130,3 +132,29 @@ def clean_denial_records(context) -> None:
         "rejected": MetadataValue.int(rejected_n),
         "total_processed": MetadataValue.int(clean_n + flagged_n + rejected_n),
     })
+
+
+@asset
+def raw_order_data(context) -> None:
+    """Fetch ServiceRequest/Claim plus supporting FHIR resources."""
+    extractor = OrderExtractor()
+    try:
+        extractor.run()
+    finally:
+        extractor.close()
+    records_read, rows_inserted = _latest_extraction_inserted("order_extractor")
+    context.add_output_metadata({
+        "records_read": MetadataValue.int(records_read),
+        "rows_inserted": MetadataValue.int(rows_inserted),
+    })
+
+
+@asset(deps=[raw_order_data])
+def prior_auth_contexts(context) -> None:
+    """Assemble prior-auth completeness packets from orders + chart + payer rules."""
+    transformer = CompletenessTransformer()
+    try:
+        transformer.run()
+    finally:
+        transformer.close()
+    context.add_output_metadata({"status": MetadataValue.text("completeness transform finished")})

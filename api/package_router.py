@@ -42,6 +42,7 @@ from .serve_router import (
     _patient_initials,
     require_admin,
 )
+from .workflows import WORKFLOW_COMPLETENESS, case_table, is_completeness
 
 package_router = APIRouter(tags=["package"])
 
@@ -108,9 +109,9 @@ FIELD_LABELS = {
 SCORE_SQL = """
 GREATEST(0, LEAST(100,
   100
-  - 40 * (
+    - 40 * (
     SELECT COUNT(*) FROM unnest(COALESCE(dc.data_quality_flags, ARRAY[]::text[])) AS f
-    WHERE starts_with(f, 'missing_required')
+    WHERE starts_with(f, 'missing_required') OR starts_with(f, 'missing_evidence')
   )
   - 10 * (
     SELECT COUNT(*) FROM unnest(COALESCE(dc.data_quality_flags, ARRAY[]::text[])) AS f
@@ -198,7 +199,7 @@ def _readiness(
     deductions: list[dict[str, Any]] = []
     for flag in flags or []:
         flag = str(flag)
-        if flag.startswith("missing_required"):
+        if flag.startswith("missing_required") or flag.startswith("missing_evidence"):
             score -= 40
             deductions.append({"flag": flag, "points": -40})
         elif flag.startswith("missing_optional"):
@@ -220,9 +221,21 @@ def _field_value(record: dict[str, Any], field_source: str | None) -> Any:
     if not field_source:
         return None
     if field_source == "member_id":
-        return record.get("patient_id")
+        return record.get("member_id") or record.get("patient_id")
     if field_source == "provider_npi":
         return record.get("ordering_provider_npi")
+    if field_source.startswith("criterion:"):
+        criterion_id = field_source.split(":", 1)[1]
+        found = record.get("evidence_found") or []
+        if isinstance(found, str):
+            try:
+                found = json.loads(found)
+            except json.JSONDecodeError:
+                found = []
+        for item in found:
+            if isinstance(item, dict) and item.get("criterion_id") == criterion_id:
+                return item.get("snippet") or item.get("matched") or True
+        return None
     return record.get(field_source)
 
 
@@ -234,7 +247,9 @@ def _item_status(record: dict[str, Any], flags: list[str], item: dict[str, Any],
     flag_set = set(flags or [])
     present = _present(value)
     if present and (
-        f"missing_required:{field}" in flag_set or f"missing_optional:{field}" in flag_set
+        f"missing_required:{field}" in flag_set
+        or f"missing_optional:{field}" in flag_set
+        or f"missing_evidence:{field.split(':', 1)[-1]}" in flag_set
     ):
         return "partial"
     if present:
@@ -251,12 +266,17 @@ def _procedure(record: dict[str, Any]) -> tuple[str | None, str | None]:
 
 
 def _context(record: dict[str, Any], has_requirements: bool) -> dict[str, bool]:
+    missing = record.get("evidence_missing") or []
     return {
         "has_clinical_notes": _present(record.get("clinical_notes_summary")),
         "has_diagnosis_codes": _present(record.get("diagnosis_codes")),
         "has_procedure_codes": _present(record.get("procedure_codes")),
         "has_denial_reason": _present(record.get("denial_reason_code")),
         "has_payer_requirements": has_requirements,
+        "auth_required": record.get("auth_required") == "yes",
+        "has_evidence_gaps": bool(missing),
+        "has_lcd_citation": _present(record.get("lcd_ncd_citation")),
+        "crd_configured": record.get("crd_status") in {"stub_connected", "connected"},
     }
 
 
@@ -272,12 +292,47 @@ def _display(value: Any) -> str | None:
     return str(value)
 
 
-def _pending_clause() -> str:
+def _pending_clause(workflow: str = WORKFLOW_DEFAULT) -> str:
+    if is_completeness(workflow):
+        return """
+        dc.assembled_at IS NOT NULL
+        AND dc.validation_status IN ('clean', 'flagged')
+        """
     return """
         dc.assembled_at IS NOT NULL
         AND dc.validation_status IN ('clean', 'flagged')
         AND NOT EXISTS (SELECT 1 FROM denial_outcomes o WHERE o.claim_id = dc.claim_id)
     """
+
+
+def _load_case(cur, claim_id: str) -> tuple[dict[str, Any] | None, str]:
+    cur.execute(
+        "SELECT * FROM prior_auth_contexts WHERE claim_id = %s OR order_id = %s LIMIT 1",
+        (claim_id, claim_id),
+    )
+    row = cur.fetchone()
+    if row:
+        return dict(row), WORKFLOW_COMPLETENESS
+    cur.execute("SELECT * FROM denial_contexts WHERE claim_id = %s LIMIT 1", (claim_id,))
+    row = cur.fetchone()
+    if row:
+        return dict(row), WORKFLOW_DEFAULT
+    return None, WORKFLOW_DEFAULT
+
+
+def _update_case(cur, claim_id: str, set_sql: str, params: list[Any]):
+    cur.execute(
+        f"UPDATE prior_auth_contexts SET {set_sql} WHERE claim_id = %s OR order_id = %s RETURNING claim_id",
+        [*params, claim_id, claim_id],
+    )
+    row = cur.fetchone()
+    if row:
+        return row
+    cur.execute(
+        f"UPDATE denial_contexts SET {set_sql} WHERE claim_id = %s RETURNING claim_id",
+        [*params, claim_id],
+    )
+    return cur.fetchone()
 
 
 def _load_items(cur, template_id: str) -> list[dict[str, Any]]:
@@ -381,7 +436,7 @@ def get_queue(
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
 ) -> dict[str, Any]:
-    del workflow
+    table = case_table(workflow)
     order = {
         "deadline_asc": "dc.payer_appeal_deadline ASC NULLS LAST, dc.assembled_at DESC",
         "deadline_desc": "dc.payer_appeal_deadline DESC NULLS LAST",
@@ -389,7 +444,7 @@ def get_queue(
         "date": "dc.assembled_at DESC",
         "assembled_at": "dc.assembled_at DESC",
     }.get(sort, "dc.payer_appeal_deadline ASC NULLS LAST, dc.assembled_at DESC")
-    clauses = [_pending_clause()]
+    clauses = [_pending_clause(workflow)]
     params: list[Any] = []
     if payer_name:
         clauses.append("dc.payer_name = %s")
@@ -398,13 +453,18 @@ def get_queue(
         clauses.append(f"({BAND_SQL}) = %s")
         params.append(readiness)
     where_sql = " AND ".join(clauses)
+    extra_cols = (
+        ", dc.auth_required, dc.lcd_ncd_citation, dc.crd_status, dc.evidence_missing, dc.evidence_found"
+        if is_completeness(workflow)
+        else ""
+    )
     with _cursor(request) as cur:
         cur.execute(
-            f"SELECT COUNT(*) AS n FROM denial_contexts dc WHERE {where_sql}",
+            f"SELECT COUNT(*) AS n FROM {table} dc WHERE {where_sql}",
             params,
         )
         total = int(cur.fetchone()["n"] or 0)
-        count_where = _pending_clause()
+        count_where = _pending_clause(workflow)
         count_params: list[Any] = []
         if payer_name:
             count_where += " AND dc.payer_name = %s"
@@ -416,7 +476,7 @@ def get_queue(
               COUNT(*) FILTER (WHERE ({BAND_SQL}) = 'ready') AS ready,
               COUNT(*) FILTER (WHERE ({BAND_SQL}) = 'incomplete') AS incomplete,
               COUNT(*) FILTER (WHERE ({BAND_SQL}) = 'review_needed') AS review_needed
-            FROM denial_contexts dc
+            FROM {table} dc
             WHERE {count_where}
             """,
             count_params,
@@ -430,11 +490,12 @@ def get_queue(
                 CASE WHEN dc.payer_appeal_deadline IS NULL THEN NULL
                      ELSE (dc.payer_appeal_deadline - CURRENT_DATE) END AS days_until_deadline,
                 dc.validation_status, dc.data_quality_flags, dc.assembled_at,
-                dc.clinical_notes_summary, dc.diagnosis_codes, dc.denial_reason_code,
-                dc.appeal_requirements, dc.manual_ready_override, dc.needs_review,
+                dc.clinical_notes_summary, dc.diagnosis_codes,
+                dc.manual_ready_override, dc.needs_review
+                {extra_cols},
                 ({SCORE_SQL}) AS score,
                 ({BAND_SQL}) AS readiness_band
-            FROM denial_contexts dc
+            FROM {table} dc
             WHERE {where_sql}
             ORDER BY {order}
             LIMIT %s OFFSET %s
@@ -443,8 +504,8 @@ def get_queue(
         )
         rows = cur.fetchall()
         cur.execute(
-            """
-            SELECT DISTINCT payer_name FROM denial_contexts
+            f"""
+            SELECT DISTINCT payer_name FROM {table}
             WHERE payer_name IS NOT NULL AND btrim(payer_name) <> ''
             ORDER BY payer_name
             """
@@ -465,7 +526,7 @@ def get_queue(
         flags = list(row.get("data_quality_flags") or [])
         score, band, deductions = _readiness(flags, bool(row.get("manual_ready_override")))
         code, description = _procedure(row)
-        has_req = bool(row.get("appeal_requirements")) or (row.get("payer_name") in requirement_payers)
+        has_req = row.get("payer_name") in requirement_payers
         items.append(
             {
                 "claim_id": row["claim_id"],
@@ -515,17 +576,15 @@ def get_package_case(
     user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
     with _cursor(request) as cur:
-        cur.execute("SELECT * FROM denial_contexts WHERE claim_id = %s LIMIT 1", (claim_id,))
-        row = cur.fetchone()
-        if not row:
+        record, workflow_used = _load_case(cur, claim_id)
+        if not record:
             raise HTTPException(status_code=404, detail="Package not found")
-        record = dict(row)
         flags = list(record.get("data_quality_flags") or [])
         score, band, deductions = _readiness(flags, bool(record.get("manual_ready_override")))
         code, description = _procedure(record)
         template = _pick_template(
             cur,
-            WORKFLOW_DEFAULT,
+            workflow_used,
             record.get("payer_name"),
             code,
             user.get("client_id"),
@@ -701,7 +760,11 @@ def get_package_case(
     if not outcomes:
         timeline.append({"at": None, "label": "Awaiting agent action", "actor": None, "future": True})
 
-    blocking = [flag for flag in flags if str(flag).startswith("missing_required")]
+    blocking = [
+        flag
+        for flag in flags
+        if str(flag).startswith("missing_required") or str(flag).startswith("missing_evidence")
+    ]
     advisory = [flag for flag in flags if str(flag).startswith("missing_optional")]
     log_audit_event(
         request,
@@ -744,14 +807,16 @@ def get_agent_preview(
     user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
     with _cursor(request) as cur:
-        cur.execute("SELECT * FROM denial_contexts WHERE claim_id = %s LIMIT 1", (claim_id,))
-        row = cur.fetchone()
-        if not row:
+        record, workflow_used = _load_case(cur, claim_id)
+        if not record:
             raise HTTPException(status_code=404, detail="Package not found")
-    record = dict(row)
     flags = list(record.get("data_quality_flags") or [])
     score, band, _deductions = _readiness(flags, bool(record.get("manual_ready_override")))
-    blocking = [flag for flag in flags if str(flag).startswith("missing_required")]
+    blocking = [
+        flag
+        for flag in flags
+        if str(flag).startswith("missing_required") or str(flag).startswith("missing_evidence")
+    ]
     advisory = [flag for flag in flags if str(flag).startswith("missing_optional")]
     payload = _jsonable(dict(record))
     instructions = {
@@ -775,7 +840,11 @@ def get_agent_preview(
     )
     return {
         "claim_id": claim_id,
-        "mcp_call": f'get_denial_context(claim_id="{claim_id}")',
+        "mcp_call": (
+            f'get_completeness_packet(order_id="{claim_id}")'
+            if is_completeness(workflow_used)
+            else f'get_denial_context(claim_id="{claim_id}")'
+        ),
         "payload": payload,
         "agent_instructions": instructions,
         "readiness_assessment": {
@@ -1107,16 +1176,12 @@ def flag_for_review(
 ) -> dict[str, bool]:
     conn = _db(request)
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(
-            """
-            UPDATE denial_contexts
-            SET needs_review = TRUE, review_reason = %s
-            WHERE claim_id = %s
-            RETURNING claim_id
-            """,
-            (body.reason.strip(), claim_id),
+        row = _update_case(
+            cur,
+            claim_id,
+            "needs_review = TRUE, review_reason = %s",
+            [body.reason.strip()],
         )
-        row = cur.fetchone()
     if not row:
         conn.rollback()
         raise HTTPException(status_code=404, detail="Package not found")
@@ -1142,19 +1207,12 @@ def mark_ready(
 ) -> dict[str, bool]:
     conn = _db(request)
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(
-            """
-            UPDATE denial_contexts
-            SET manual_ready_override = TRUE,
-                override_note = %s,
-                override_by = %s,
-                override_at = NOW()
-            WHERE claim_id = %s
-            RETURNING claim_id
-            """,
-            (body.override_note.strip(), str(user["id"]), claim_id),
+        row = _update_case(
+            cur,
+            claim_id,
+            "manual_ready_override = TRUE, override_note = %s, override_by = %s, override_at = NOW()",
+            [body.override_note.strip(), str(user["id"])],
         )
-        row = cur.fetchone()
     if not row:
         conn.rollback()
         raise HTTPException(status_code=404, detail="Package not found")

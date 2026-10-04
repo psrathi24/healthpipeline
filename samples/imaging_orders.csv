@@ -1,0 +1,4 @@
+order_id,patient_id,member_id,payer_name,procedure_code,diagnosis_codes,service_date,ordering_provider_npi,notes
+SR-72148-001,pat-jane-01,AETNA12345,Aetna,72148,M54.5,2026-10-20,1234567893,"Patient completed 8 weeks of physical therapy and NSAIDs without relief. Straight-leg raise positive on the right. Request lumbar MRI without contrast."
+SR-72148-002,pat-john-02,UHC99881,UnitedHealthcare,72148,M51.16,2026-10-22,1234567893,"Low back pain for 3 months. No documented physical therapy. Patient wants imaging before starting conservative care."
+SR-72141-001,pat-lee-03,MEDICARE1A,Medicare,72141,M50.20,2026-10-18,1987654321,"Cervical radiculopathy. Six weeks of physical therapy completed. Neurological exam shows C6 sensory changes. Prior x-ray negative."

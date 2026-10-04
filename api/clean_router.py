@@ -38,6 +38,7 @@ from .serve_router import (
     _patient_initials,
     require_admin,
 )
+from .workflows import WORKFLOW_COMPLETENESS, case_table, is_completeness
 
 clean_router = APIRouter(tags=["clean"])
 
@@ -408,16 +409,30 @@ def get_summary(
     date_from: date | None = None,
     date_to: date | None = None,
 ) -> dict[str, Any]:
-    del workflow
     start, end = _ensure_date_range(date_from, date_to)
+    table = case_table(workflow)
+    source_join = (
+        "LEFT JOIN raw_fhir_responses r ON r.resource_id = dc.raw_resource_id"
+        if is_completeness(workflow)
+        else """
+            LEFT JOIN LATERAL (
+                SELECT raw_resource_id
+                FROM clean_denial_records c
+                WHERE c.claim_id = dc.claim_id
+                ORDER BY c.id DESC
+                LIMIT 1
+            ) c ON TRUE
+            LEFT JOIN raw_fhir_responses r ON r.resource_id = c.raw_resource_id
+        """
+    )
     with _cursor(request) as cur:
         cur.execute(
-            """
+            f"""
             SELECT
                 COUNT(*) AS total_processed,
                 COUNT(*) FILTER (WHERE validation_status = 'clean') AS clean,
                 COUNT(*) FILTER (WHERE validation_status = 'flagged') AS flagged
-            FROM denial_contexts
+            FROM {table}
             WHERE assembled_at::date BETWEEN %s AND %s
             """,
             (start, end),
@@ -429,14 +444,15 @@ def get_summary(
             FROM quarantine_records
             WHERE COALESCE(created_at, NOW())::date BETWEEN %s AND %s
               AND COALESCE(review_action, '') <> 'dismissed'
+              AND COALESCE(workflow, %s) = %s
             """,
-            (start, end),
+            (start, end, WORKFLOW_DEFAULT, workflow),
         )
         quarantined = int((cur.fetchone() or {}).get("quarantined") or 0)
         cur.execute(
-            """
+            f"""
             SELECT flag, COUNT(*) AS count
-            FROM denial_contexts dc
+            FROM {table} dc
             CROSS JOIN LATERAL unnest(COALESCE(dc.data_quality_flags, ARRAY[]::text[])) AS flag
             WHERE dc.assembled_at::date BETWEEN %s AND %s
             GROUP BY flag
@@ -447,17 +463,10 @@ def get_summary(
         )
         flags = cur.fetchall()
         cur.execute(
-            """
+            f"""
             SELECT COALESCE(r.source, 'unknown') AS source, COUNT(*) AS records
-            FROM denial_contexts dc
-            LEFT JOIN LATERAL (
-                SELECT raw_resource_id
-                FROM clean_denial_records c
-                WHERE c.claim_id = dc.claim_id
-                ORDER BY c.id DESC
-                LIMIT 1
-            ) c ON TRUE
-            LEFT JOIN raw_fhir_responses r ON r.resource_id = c.raw_resource_id
+            FROM {table} dc
+            {source_join}
             WHERE dc.assembled_at::date BETWEEN %s AND %s
             GROUP BY 1
             ORDER BY COUNT(*) DESC
@@ -465,14 +474,16 @@ def get_summary(
             (start, end),
         )
         sources = cur.fetchall()
-        cur.execute("SELECT MAX(assembled_at) AS last_run FROM denial_contexts")
+        cur.execute(f"SELECT MAX(assembled_at) AS last_run FROM {table}")
         last_run = (cur.fetchone() or {}).get("last_run")
         cur.execute(
             """
             SELECT COUNT(*) AS n
             FROM quarantine_records
             WHERE review_action IS NULL
-            """
+              AND COALESCE(workflow, %s) = %s
+            """,
+            (WORKFLOW_DEFAULT, workflow),
         )
         unreviewed = int((cur.fetchone() or {}).get("n") or 0)
     total = int(counts.get("total_processed") or 0) + quarantined
@@ -489,7 +500,7 @@ def get_summary(
     ]
     return _jsonable(
         {
-            "workflow": WORKFLOW_DEFAULT,
+            "workflow": workflow,
             "period_start": start.isoformat(),
             "period_end": end.isoformat(),
             "total_processed": total,
@@ -524,7 +535,7 @@ def list_records(
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
 ) -> dict[str, Any]:
-    del workflow
+    table = case_table(workflow)
     include_clean = status_filter in {None, "all", "clean", "flagged"}
     include_flagged = status_filter in {None, "all", "clean", "flagged"}
     include_quarantine = status_filter in {None, "all", "quarantined"}
@@ -543,8 +554,8 @@ def list_records(
     sources: list[str] = []
     with _cursor(request) as cur:
         cur.execute(
-            """
-            SELECT DISTINCT payer_name FROM denial_contexts
+            f"""
+            SELECT DISTINCT payer_name FROM {table}
             WHERE payer_name IS NOT NULL AND btrim(payer_name) <> ''
             ORDER BY payer_name
             """
@@ -582,18 +593,19 @@ def list_records(
                 clauses.append("dc.claim_id ILIKE %s")
                 params.append(f"%{search.strip()}%")
             if source:
-                clauses.append("COALESCE(r.source, 'manual') = %s")
-                params.append(source)
+                if is_completeness(workflow):
+                    clauses.append("COALESCE(r.source, 'manual') = %s")
+                    params.append(source)
+                else:
+                    clauses.append("COALESCE(r.source, 'manual') = %s")
+                    params.append(source)
             order = "dc.assembled_at DESC NULLS LAST"
             if sort == "assembled_at_asc":
                 order = "dc.assembled_at ASC NULLS LAST"
-            cur.execute(
-                f"""
-                SELECT
-                    dc.claim_id, dc.patient_id, dc.payer_name, dc.service_date,
-                    dc.validation_status, dc.data_quality_flags, dc.assembled_at,
-                    r.source, c.raw_resource_id
-                FROM denial_contexts dc
+            source_join = (
+                "LEFT JOIN raw_fhir_responses r ON r.resource_id = dc.raw_resource_id"
+                if is_completeness(workflow)
+                else """
                 LEFT JOIN LATERAL (
                     SELECT raw_resource_id
                     FROM clean_denial_records x
@@ -602,6 +614,16 @@ def list_records(
                     LIMIT 1
                 ) c ON TRUE
                 LEFT JOIN raw_fhir_responses r ON r.resource_id = c.raw_resource_id
+                """
+            )
+            cur.execute(
+                f"""
+                SELECT
+                    dc.claim_id, dc.patient_id, dc.payer_name, dc.service_date,
+                    dc.validation_status, dc.data_quality_flags, dc.assembled_at,
+                    r.source, {'dc.raw_resource_id' if is_completeness(workflow) else 'c.raw_resource_id'}
+                FROM {table} dc
+                {source_join}
                 WHERE {' AND '.join(clauses)}
                 ORDER BY {order}
                 """,
@@ -625,8 +647,8 @@ def list_records(
                 )
 
         if include_quarantine:
-            q_clauses = ["TRUE"]
-            q_params: list[Any] = []
+            q_clauses = ["COALESCE(qr.workflow, %s) = %s"]
+            q_params: list[Any] = [WORKFLOW_DEFAULT, workflow]
             if date_from:
                 q_clauses.append("COALESCE(qr.created_at, NOW())::date >= %s")
                 q_params.append(date_from)
@@ -696,8 +718,11 @@ def get_record(
     user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
     with _cursor(request) as cur:
-        cur.execute("SELECT * FROM denial_contexts WHERE claim_id = %s LIMIT 1", (claim_id,))
+        cur.execute("SELECT * FROM prior_auth_contexts WHERE claim_id = %s OR order_id = %s LIMIT 1", (claim_id, claim_id))
         row = cur.fetchone()
+        if not row:
+            cur.execute("SELECT * FROM denial_contexts WHERE claim_id = %s LIMIT 1", (claim_id,))
+            row = cur.fetchone()
         quarantine = None
         if not row:
             cur.execute(
@@ -861,34 +886,64 @@ def approve_quarantine(
         flags = list(row.get("data_quality_flags") or [])
         flags.append(f"manual_override: {body.override_reason.strip()}")
         service_date = record.get("service_date") or None
-        cur.execute(
-            """
-            INSERT INTO denial_contexts (
-                claim_id, patient_id, service_date, denial_reason_code, denial_category,
-                canonical_denial_description, payer_name, diagnosis_codes, procedure_codes,
-                total_claim_amount, data_quality_flags, validation_status, assembled_at
+        workflow = row.get("workflow") or record.get("workflow") or WORKFLOW_DEFAULT
+        if is_completeness(workflow):
+            cur.execute(
+                """
+                INSERT INTO prior_auth_contexts (
+                    order_id, claim_id, patient_id, member_id, service_date, payer_name,
+                    diagnosis_codes, procedure_codes, clinical_notes_summary,
+                    data_quality_flags, validation_status, assembled_at, auth_required
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'flagged', NOW(), %s)
+                ON CONFLICT (claim_id) DO UPDATE SET
+                    data_quality_flags = EXCLUDED.data_quality_flags,
+                    validation_status = 'flagged'
+                RETURNING id, claim_id
+                """,
+                (
+                    record.get("order_id") or claim_id,
+                    claim_id,
+                    record.get("patient_id"),
+                    record.get("member_id"),
+                    service_date,
+                    record.get("payer_name"),
+                    record.get("diagnosis_codes") or [],
+                    record.get("procedure_codes") or [],
+                    record.get("clinical_notes_summary"),
+                    flags,
+                    record.get("auth_required") or "unknown",
+                ),
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'flagged', NOW())
-            ON CONFLICT (claim_id) DO UPDATE SET
-                data_quality_flags = EXCLUDED.data_quality_flags,
-                validation_status = 'flagged',
-                needs_reprocessing = FALSE
-            RETURNING id, claim_id
-            """,
-            (
-                claim_id,
-                record.get("patient_id"),
-                service_date,
-                record.get("denial_reason_code"),
-                record.get("denial_category"),
-                record.get("canonical_denial_description"),
-                record.get("payer_name"),
-                record.get("diagnosis_codes") or [],
-                record.get("procedure_codes") or [],
-                record.get("total_claim_amount"),
-                flags,
-            ),
-        )
+        else:
+            cur.execute(
+                """
+                INSERT INTO denial_contexts (
+                    claim_id, patient_id, service_date, denial_reason_code, denial_category,
+                    canonical_denial_description, payer_name, diagnosis_codes, procedure_codes,
+                    total_claim_amount, data_quality_flags, validation_status, assembled_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'flagged', NOW())
+                ON CONFLICT (claim_id) DO UPDATE SET
+                    data_quality_flags = EXCLUDED.data_quality_flags,
+                    validation_status = 'flagged',
+                    needs_reprocessing = FALSE
+                RETURNING id, claim_id
+                """,
+                (
+                    claim_id,
+                    record.get("patient_id"),
+                    service_date,
+                    record.get("denial_reason_code"),
+                    record.get("denial_category"),
+                    record.get("canonical_denial_description"),
+                    record.get("payer_name"),
+                    record.get("diagnosis_codes") or [],
+                    record.get("procedure_codes") or [],
+                    record.get("total_claim_amount"),
+                    flags,
+                ),
+            )
         inserted = cur.fetchone()
         cur.execute(
             """

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -34,6 +35,7 @@ from pydantic import BaseModel, Field
 from .auth_router import get_current_user, log_audit_event
 from .auth_security import encrypt_secret, load_public_key, utcnow
 from .serve_router import FORBIDDEN, WORKFLOW_DEFAULT, _forbidden, _jsonable, require_admin
+from .workflows import is_completeness
 
 connect_router = APIRouter(tags=["connect"])
 
@@ -49,8 +51,8 @@ CATALOG: list[dict[str, Any]] = [
         "category": "ehr",
         "description": "Connect your Epic EHR instance via FHIR Backend Services API. Requires your IT team to register the app in Epic's developer portal.",
         "auth_method": "smart_backend_services",
-        "fhir_resources": ["ExplanationOfBenefit", "Claim", "Patient", "Coverage", "DocumentReference"],
-        "workflows_supported": ["prior_auth_denial", "eligibility_verification", "remittance_processing"],
+        "fhir_resources": ["ExplanationOfBenefit", "Claim", "Patient", "Coverage", "DocumentReference", "ServiceRequest"],
+        "workflows_supported": ["prior_auth_completeness", "prior_auth_denial", "eligibility_verification", "remittance_processing"],
         "setup_complexity": "complex",
         "it_required": True,
         "documentation_url": "https://fhir.epic.com/",
@@ -62,8 +64,8 @@ CATALOG: list[dict[str, Any]] = [
         "category": "ehr",
         "description": "Connect athenaOne via FHIR. Your IT team registers the app in the athenahealth developer portal.",
         "auth_method": "oauth2",
-        "fhir_resources": ["ExplanationOfBenefit", "Claim", "Patient", "Coverage"],
-        "workflows_supported": ["prior_auth_denial", "eligibility_verification"],
+        "fhir_resources": ["ExplanationOfBenefit", "Claim", "Patient", "Coverage", "ServiceRequest"],
+        "workflows_supported": ["prior_auth_completeness", "prior_auth_denial", "eligibility_verification"],
         "setup_complexity": "moderate",
         "it_required": True,
         "documentation_url": "https://docs.athenahealth.com/",
@@ -75,8 +77,8 @@ CATALOG: list[dict[str, Any]] = [
         "category": "ehr",
         "description": "Connect Oracle Health (Cerner) via SMART Backend Services.",
         "auth_method": "smart_backend_services",
-        "fhir_resources": ["ExplanationOfBenefit", "Claim", "Patient", "Coverage", "DocumentReference"],
-        "workflows_supported": ["prior_auth_denial", "eligibility_verification"],
+        "fhir_resources": ["ExplanationOfBenefit", "Claim", "Patient", "Coverage", "DocumentReference", "ServiceRequest"],
+        "workflows_supported": ["prior_auth_completeness", "prior_auth_denial", "eligibility_verification"],
         "setup_complexity": "complex",
         "it_required": True,
         "documentation_url": "https://fhir.cerner.com/",
@@ -88,8 +90,8 @@ CATALOG: list[dict[str, Any]] = [
         "category": "ehr",
         "description": "Connect eClinicalWorks via FHIR R4.",
         "auth_method": "oauth2",
-        "fhir_resources": ["ExplanationOfBenefit", "Claim", "Patient", "Coverage"],
-        "workflows_supported": ["prior_auth_denial"],
+        "fhir_resources": ["ExplanationOfBenefit", "Claim", "Patient", "Coverage", "ServiceRequest"],
+        "workflows_supported": ["prior_auth_completeness", "prior_auth_denial"],
         "setup_complexity": "moderate",
         "it_required": True,
         "documentation_url": "https://fhir.eclinicalworks.com/",
@@ -114,8 +116,8 @@ CATALOG: list[dict[str, Any]] = [
         "category": "ehr",
         "description": "Public HAPI FHIR R4 sandbox. No credentials required. Use this to validate the pipeline before connecting a production EHR.",
         "auth_method": "none",
-        "fhir_resources": ["ExplanationOfBenefit", "Claim", "Patient", "Coverage"],
-        "workflows_supported": ["prior_auth_denial"],
+        "fhir_resources": ["ExplanationOfBenefit", "Claim", "Patient", "Coverage", "ServiceRequest", "DocumentReference"],
+        "workflows_supported": ["prior_auth_completeness", "prior_auth_denial"],
         "setup_complexity": "simple",
         "it_required": False,
         "documentation_url": "https://hapi.fhir.org/",
@@ -128,10 +130,23 @@ CATALOG: list[dict[str, Any]] = [
         "description": "Connect a payer FHIR endpoint for prior authorization and denial detail. Most payers will have mandated APIs by 2027.",
         "auth_method": "oauth2",
         "fhir_resources": ["ExplanationOfBenefit", "Claim", "Coverage"],
-        "workflows_supported": ["prior_auth_denial", "eligibility_verification"],
+        "workflows_supported": ["prior_auth_completeness", "prior_auth_denial", "eligibility_verification"],
         "setup_complexity": "moderate",
         "it_required": True,
         "documentation_url": "https://hl7.org/fhir/",
+        "required_fields": ["client_id", "client_secret", "fhir_base_url", "token_url"],
+    },
+    {
+        "connector_type": "payer_crd",
+        "display_name": "Payer CRD (Coverage Requirements Discovery stub)",
+        "category": "payer",
+        "description": "Stub for Da Vinci CRD. Connecting this records that a Coverage Requirements Discovery endpoint is configured; live CRD questionnaire fetch is Phase 3. Completeness still uses local auth rules and LCD/NCD samples until the payer API answers.",
+        "auth_method": "oauth2",
+        "fhir_resources": ["Coverage", "Questionnaire"],
+        "workflows_supported": ["prior_auth_completeness"],
+        "setup_complexity": "moderate",
+        "it_required": True,
+        "documentation_url": "https://hl7.org/fhir/us/davinci-crd/",
         "required_fields": ["client_id", "client_secret", "fhir_base_url", "token_url"],
     },
     {
@@ -203,10 +218,10 @@ CATALOG: list[dict[str, Any]] = [
         "connector_type": "file_upload_fhir",
         "display_name": "Manual FHIR bundle upload",
         "category": "file",
-        "description": "Upload FHIR JSON bundles. Supports R4 EOB, Claim, and Patient resources.",
+        "description": "Upload FHIR JSON bundles. Supports R4 ServiceRequest, Claim, EOB, and Patient resources.",
         "auth_method": "file_upload",
-        "fhir_resources": ["ExplanationOfBenefit", "Claim", "Patient"],
-        "workflows_supported": ["prior_auth_denial"],
+        "fhir_resources": ["ExplanationOfBenefit", "Claim", "Patient", "ServiceRequest"],
+        "workflows_supported": ["prior_auth_completeness", "prior_auth_denial"],
         "setup_complexity": "simple",
         "it_required": False,
         "documentation_url": None,
@@ -216,10 +231,10 @@ CATALOG: list[dict[str, Any]] = [
         "connector_type": "file_upload_custom",
         "display_name": "Custom file upload",
         "category": "file",
-        "description": "Upload CSV or XML exports when a payer has no API connection.",
+        "description": "Upload CSV order extracts or payer policy text when a payer has no API connection.",
         "auth_method": "file_upload",
         "fhir_resources": [],
-        "workflows_supported": ["prior_auth_denial"],
+        "workflows_supported": ["prior_auth_completeness", "prior_auth_denial"],
         "setup_complexity": "simple",
         "it_required": False,
         "documentation_url": None,
@@ -954,7 +969,7 @@ def _validate_magic(data: bytes, file_type: str) -> None:
         if not (b"ISA" in data[:1024] or b"ST*835" in data[:2048] or head.startswith(b"ISA")):
             if not (head[:3].isascii() and b"," in head[:200]):
                 raise HTTPException(status_code=400, detail="Expected X12 835 EDI format.")
-    elif file_type == "custom":
+    elif file_type in {"custom", "policy_text"}:
         if not head:
             raise HTTPException(status_code=400, detail="File is empty.")
 
@@ -975,6 +990,59 @@ def _extract_count(data: bytes, file_type: str) -> int:
     return max(0, len(lines) - 1)
 
 
+def _process_completeness_upload(app_db, data: bytes, job: dict[str, Any]) -> int:
+    text = data.decode("utf-8", errors="ignore")
+    header = (text.splitlines()[0] if text.strip() else "").lower()
+    file_type = job.get("file_type")
+    if file_type != "policy_text" and "order_id" in header:
+        transformers_dir = str(_ROOT / "transformers")
+        if transformers_dir not in sys.path:
+            sys.path.insert(0, transformers_dir)
+        if str(_ROOT) not in sys.path:
+            sys.path.insert(0, str(_ROOT))
+        from completeness_transformer import CompletenessTransformer  # type: ignore
+
+        transformer = CompletenessTransformer()
+        try:
+            counts = transformer.ingest_orders_csv(text)
+        finally:
+            transformer.close()
+        return int(counts.get("rows") or 0)
+    from .completeness_router import suggest_criteria
+
+    suggested = suggest_criteria(text)
+    transformers_dir = str(_ROOT / "transformers")
+    if transformers_dir not in sys.path:
+        sys.path.insert(0, transformers_dir)
+    if str(_ROOT) not in sys.path:
+        sys.path.insert(0, str(_ROOT))
+    from completeness_transformer import CompletenessTransformer  # type: ignore
+
+    transformer = CompletenessTransformer()
+    try:
+        transformer.ensure_schema()
+        with transformer.conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO policy_drafts (
+                    client_id, source_filename, raw_text, suggested_items, status
+                )
+                VALUES (%s, %s, %s, %s::jsonb, 'pending')
+                """,
+                (
+                    job.get("client_id"),
+                    job.get("original_filename"),
+                    text[:200000],
+                    json.dumps(suggested),
+                ),
+            )
+        transformer.conn.commit()
+    finally:
+        transformer.close()
+    del app_db
+    return len(suggested)
+
+
 def _process_upload(app_db, upload_id: str) -> None:
     with app_db.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute("SELECT * FROM file_upload_jobs WHERE id = %s", (upload_id,))
@@ -986,6 +1054,8 @@ def _process_upload(app_db, upload_id: str) -> None:
         try:
             data = path.read_bytes()
             count = _extract_count(data, job["file_type"])
+            if is_completeness(job.get("workflow")):
+                count = _process_completeness_upload(app_db, data, dict(job)) or count
             cur.execute(
                 """
                 UPDATE file_upload_jobs
@@ -1016,7 +1086,7 @@ async def upload_file(
     workflow: str = Form(WORKFLOW_DEFAULT),
     description: str | None = Form(None),
 ) -> dict[str, Any]:
-    if file_type not in {"era_835", "fhir_bundle", "custom"}:
+    if file_type not in {"era_835", "fhir_bundle", "custom", "policy_text"}:
         raise HTTPException(status_code=400, detail="Invalid file type")
     data = await file.read()
     if len(data) > MAX_UPLOAD_BYTES:
@@ -1139,18 +1209,31 @@ def _onboarding_steps(cur, user: dict[str, Any]) -> list[dict[str, Any]]:
         """
     )
     extracts = int((cur.fetchone() or {}).get("n") or 0)
+    cur.execute(
+        """
+        SELECT COUNT(*) AS n FROM file_upload_jobs
+        WHERE client_id = %s AND status = 'complete'
+        """,
+        (client_id,),
+    )
+    uploads = int((cur.fetchone() or {}).get("n") or 0)
+    cur.execute("SELECT COUNT(*) AS n FROM prior_auth_contexts")
+    packets = int((cur.fetchone() or {}).get("n") or 0)
+    cur.execute("SELECT COUNT(*) AS n FROM denial_contexts")
+    denials = int((cur.fetchone() or {}).get("n") or 0)
+    has_data = uploads > 0 or packets > 0 or denials > 0
     cur.execute("SELECT COUNT(*) AS n FROM portal_vendor_connections WHERE client_id = %s AND is_active = TRUE", (client_id,))
     vendors = int((cur.fetchone() or {}).get("n") or 0)
-    ehr = bool(cons.get("has_ehr"))
-    workflow = bool(cons.get("has_workflow"))
+    ehr = bool(cons.get("has_ehr")) or has_data
+    workflow = bool(cons.get("has_workflow")) or has_data
     payers = bool(client.get("payer_mappings_reviewed_at"))
-    first_run = ehr and extracts > 0
+    first_run = (bool(cons.get("has_ehr")) and extracts > 0) or has_data
     baa = bool(client.get("baa_acknowledged_at"))
     return [
         {
             "id": "ehr_connected",
             "label": "Connect your EHR system",
-            "description": "Connect the system that holds claims and clinical data.",
+            "description": "Connect the system that holds claims and clinical data, or upload an orders CSV.",
             "complete": ehr,
             "required": True,
             "action_url": "/portal/connect/sources",

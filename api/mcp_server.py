@@ -29,9 +29,10 @@ AppealOutcome = Literal["approved", "denied", "pending", "escalated"]
 mcp = MCPServer(
     name="kalamon",
     instructions=(
-        "Kalamon healthcare data pipeline for prior authorization denial workflows. "
-        "Load workflow rules, retrieve denial contexts, list pending cases by appeal "
-        "deadline, and record appeal outcomes."
+        "Kalamon healthcare data pipeline. Primary live workflow is prior-auth "
+        "completeness (DTR-shaped pre-submit packets). Denial contexts remain available "
+        "as a secondary workflow. Load workflow rules, retrieve completeness packets or "
+        "denial contexts, list pending cases, and record appeal outcomes for denials."
     ),
 )
 
@@ -114,6 +115,88 @@ def get_denial_context(
     except psycopg2.Error as exc:
         logger.exception("get_denial_context failed claim_id={}", claim_id)
         return _error(f"Database error retrieving denial context: {exc}")
+
+
+@mcp.tool(
+    description=(
+        "Retrieve a prior-auth completeness packet for an order. Returns whether auth "
+        "is required, LCD/NCD citation if known, evidence found vs missing, data quality "
+        "flags, and the assembled packet. This is a pre-submit completeness record — not "
+        "a PAS submission and not a UM approve/deny decision."
+    )
+)
+def get_completeness_packet(
+    order_id: Annotated[str, Field(description="The order_id or claim_id of the completeness packet")],
+) -> str:
+    try:
+        with _db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT *
+                FROM prior_auth_contexts
+                WHERE claim_id = %s OR order_id = %s
+                LIMIT 1
+                """,
+                (order_id, order_id),
+            )
+            row = cur.fetchone()
+        logger.info("get_completeness_packet order_id={} rows={}", order_id, 1 if row else 0)
+        if row is None:
+            return _error(f"No completeness packet found for order_id={order_id!r}")
+        return _dumps(_as_dict(row))
+    except psycopg2.Error as exc:
+        logger.exception("get_completeness_packet failed order_id={}", order_id)
+        return _error(f"Database error retrieving completeness packet: {exc}")
+
+
+@mcp.tool(
+    description=(
+        "List prior-auth completeness packets that still have missing evidence or required "
+        "fields. Sorted by planned service date. Use this before submitting a prior auth."
+    )
+)
+def list_pending_auth_packets(
+    limit: Annotated[int, Field(description="Max records to return")] = 20,
+    payer_name: Annotated[str | None, Field(description="Filter by payer name")] = None,
+    status: Annotated[
+        str | None,
+        Field(description="Filter by validation_status: clean, flagged"),
+    ] = None,
+) -> str:
+    limit = max(1, min(int(limit), 500))
+    clauses = ["dc.assembled_at IS NOT NULL", "dc.validation_status IN ('clean', 'flagged')"]
+    params: list[Any] = []
+    if payer_name:
+        clauses.append("dc.payer_name = %s")
+        params.append(payer_name)
+    if status:
+        clauses.append("dc.validation_status = %s")
+        params.append(status)
+    where_sql = " AND ".join(clauses)
+    params.append(limit)
+    try:
+        with _db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                f"""
+                SELECT
+                    dc.*,
+                    CASE
+                        WHEN dc.payer_appeal_deadline IS NULL THEN NULL
+                        ELSE (dc.payer_appeal_deadline - CURRENT_DATE)
+                    END AS days_until_deadline
+                FROM prior_auth_contexts dc
+                WHERE {where_sql}
+                ORDER BY dc.payer_appeal_deadline ASC NULLS LAST, dc.assembled_at DESC
+                LIMIT %s
+                """,
+                params,
+            )
+            rows = [_as_dict(row) for row in cur.fetchall()]
+        logger.info("list_pending_auth_packets rows={}", len(rows))
+        return _dumps(rows)
+    except psycopg2.Error as exc:
+        logger.exception("list_pending_auth_packets failed")
+        return _error(f"Database error listing completeness packets: {exc}")
 
 
 @mcp.tool(
