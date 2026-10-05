@@ -54,18 +54,20 @@ CPT_LABELS = {
 }
 
 FIELD_HINTS = {
-    "claim_id": "Not found in EOB. Check 837 claim.reference or the payer portal for this claim.",
+    "claim_id": "Order ID was not on the ServiceRequest. Check the EHR order number.",
     "patient_id": "Not found in the Patient reference. Link this resource to the EHR Patient record.",
-    "member_id": "Not found in Coverage.subscriberId. Check the 271 eligibility response.",
-    "service_date": "Not found in billablePeriod.start. Check the encounter appointment date.",
-    "denial_reason_code": "Not found in EOB error[] or adjudication. Check ERA 835 CAS segment.",
-    "diagnosis_codes": "Not found in diagnosis[].coding. Check encounter documentation for ICD-10.",
-    "procedure_codes": "Not found in item[].productOrService. Check charge capture / CPT.",
-    "payer_name": "Not found in insurer.display. Confirm coverage or add a payer mapping.",
-    "clinical_notes_summary": "No clinical notes found. Pull the visit note from the EHR.",
+    "member_id": "Not found in Coverage.subscriberId. Confirm coverage on the chart.",
+    "service_date": "Not found in ServiceRequest.occurrenceDateTime. Check the order date.",
+    "denial_reason_code": "Not used for completeness packets.",
+    "diagnosis_codes": "Not found in Claim.diagnosis or Condition. Check encounter documentation for ICD-10.",
+    "procedure_codes": "Not found in ServiceRequest.code. Confirm the ordered CPT.",
+    "payer_name": "Not found in Coverage.payor. Confirm coverage or add a payer mapping.",
+    "clinical_notes_summary": "No clinical notes found. Pull the visit note or report from DocumentReference.",
     "provider_npi": "Ordering provider NPI was not in the source resource. Confirm in the EHR.",
-    "payer_appeal_deadline": "Deadline could not be calculated. Confirm the payer appeal window.",
-    "appeal_requirements": "No payer-specific appeal requirements stored for this case.",
+    "payer_appeal_deadline": "Deadline could not be calculated. Confirm the payer window.",
+    "appeal_requirements": "Not used for completeness packets.",
+    "auth_required": "No local auth-required rule or LCD/NCD matched this payer × CPT.",
+    "lcd_ncd_citation": "No LCD/NCD citation stored for this payer × CPT.",
 }
 
 FIELD_SOURCES = {
@@ -87,6 +89,36 @@ FIELD_SOURCES = {
     "canonical_denial_description": ("ERA 835", "code_mappings description"),
 }
 
+COMPLETENESS_FIELD_SOURCES = {
+    "claim_id": ("Order extract", "ServiceRequest.id / order_id"),
+    "patient_id": ("EHR FHIR", "Patient.reference"),
+    "member_id": ("EHR FHIR", "Coverage.subscriberId"),
+    "service_date": ("EHR FHIR", "ServiceRequest.occurrenceDateTime"),
+    "procedure_codes": ("EHR FHIR", "ServiceRequest.code"),
+    "diagnosis_codes": ("EHR FHIR", "Claim.diagnosis / Condition"),
+    "payer_name": ("EHR FHIR", "Coverage.payor"),
+    "clinical_notes_summary": ("EHR FHIR", "DocumentReference"),
+    "provider_npi": ("EHR FHIR", "Practitioner.identifier"),
+    "ordering_provider_npi": ("EHR FHIR", "ServiceRequest.requester"),
+    "auth_required": ("Local rules", "auth_required_rules / LCD-NCD"),
+    "lcd_ncd_citation": ("Payer policy", "coverage_policies.citation"),
+}
+
+COMPLETENESS_EVIDENCE_FIELDS = [
+    "claim_id",
+    "patient_id",
+    "member_id",
+    "service_date",
+    "procedure_codes",
+    "diagnosis_codes",
+    "payer_name",
+    "clinical_notes_summary",
+    "provider_npi",
+    "ordering_provider_npi",
+    "auth_required",
+    "lcd_ncd_citation",
+]
+
 FIELD_LABELS = {
     "claim_id": "Claim ID",
     "patient_id": "Patient ID",
@@ -104,6 +136,8 @@ FIELD_LABELS = {
     "clinical_notes_summary": "Clinical notes summary",
     "provider_npi": "Ordering provider NPI",
     "ordering_provider_npi": "Ordering provider NPI",
+    "auth_required": "Auth required",
+    "lcd_ncd_citation": "LCD / NCD citation",
 }
 
 SCORE_SQL = """
@@ -610,19 +644,24 @@ def get_package_case(
             (record.get("payer_name"),),
         )
         payer_requirements = [_jsonable(dict(row)) for row in cur.fetchall()]
-        cur.execute(
-            """
-            SELECT appeal_filed_at, appeal_method, appeal_outcome, created_at, agent_used
-            FROM denial_outcomes WHERE claim_id = %s ORDER BY created_at
-            """,
-            (claim_id,),
-        )
-        outcomes = [_jsonable(dict(row)) for row in cur.fetchall()]
+        outcomes: list[dict[str, Any]] = []
+        if not is_completeness(workflow_used):
+            cur.execute(
+                """
+                SELECT appeal_filed_at, appeal_method, appeal_outcome, created_at, agent_used
+                FROM denial_outcomes WHERE claim_id = %s ORDER BY created_at
+                """,
+                (claim_id,),
+            )
+            outcomes = [_jsonable(dict(row)) for row in cur.fetchall()]
         cur.execute(
             """
             SELECT extractor_name, started_at, completed_at, status, records_inserted
             FROM extraction_log
             WHERE status = 'success'
+              AND extractor_name NOT ILIKE '%eob%'
+              AND extractor_name NOT ILIKE '%bluebutton%'
+              AND extractor_name NOT ILIKE '%era%'
             ORDER BY completed_at DESC NULLS LAST
             LIMIT 3
             """
@@ -655,27 +694,32 @@ def get_package_case(
             }
         )
 
-    evidence_fields = [
-        "claim_id",
-        "patient_id",
-        "member_id",
-        "service_date",
-        "procedure_codes",
-        "diagnosis_codes",
-        "total_claim_amount",
-        "denial_reason_code",
-        "denial_category",
-        "canonical_denial_description",
-        "payer_name",
-        "payer_appeal_deadline",
-        "clinical_notes_summary",
-        "provider_npi",
-        "appeal_requirements",
-        "ordering_provider_npi",
-    ]
+    evidence_fields = (
+        COMPLETENESS_EVIDENCE_FIELDS
+        if is_completeness(workflow_used)
+        else [
+            "claim_id",
+            "patient_id",
+            "member_id",
+            "service_date",
+            "procedure_codes",
+            "diagnosis_codes",
+            "total_claim_amount",
+            "denial_reason_code",
+            "denial_category",
+            "canonical_denial_description",
+            "payer_name",
+            "payer_appeal_deadline",
+            "clinical_notes_summary",
+            "provider_npi",
+            "appeal_requirements",
+            "ordering_provider_npi",
+        ]
+    )
+    sources_map = COMPLETENESS_FIELD_SOURCES if is_completeness(workflow_used) else FIELD_SOURCES
     evidence = []
     for field in evidence_fields:
-        source, transform = FIELD_SOURCES.get(field, (None, None))
+        source, transform = sources_map.get(field, (None, None))
         value = _field_value(record, field if field != "ordering_provider_npi" else "provider_npi")
         if field == "ordering_provider_npi":
             value = record.get("ordering_provider_npi")
@@ -684,7 +728,7 @@ def get_package_case(
         if field in {"provider_npi", "ordering_provider_npi"}:
             mapped = "provider_npi"
         present = _present(value)
-        if not FIELD_SOURCES.get(field) and field not in record and field not in {"member_id", "provider_npi"}:
+        if not sources_map.get(field) and field not in record and field not in {"member_id", "provider_npi"}:
             status_name = "missing"
         elif mapped and (
             f"missing_required:{mapped}" in flag_set or f"missing_optional:{mapped}" in flag_set
@@ -712,7 +756,7 @@ def get_package_case(
         timeline.append(
             {
                 "at": when,
-                "label": f"Raw EOB received from {ext.get('extractor_name')}",
+                "label": f"Order received from {ext.get('extractor_name')}",
                 "actor": ext.get("extractor_name"),
                 "future": False,
             }

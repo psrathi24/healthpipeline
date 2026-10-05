@@ -486,6 +486,41 @@ def get_summary(
             (WORKFLOW_DEFAULT, workflow),
         )
         unreviewed = int((cur.fetchone() or {}).get("n") or 0)
+        flow = {
+            "ingested": 0,
+            "criteria_applied": 0,
+            "evidence_matched": 0,
+            "completed": 0,
+        }
+        if is_completeness(workflow):
+            cur.execute(
+                """
+                SELECT
+                    COUNT(*) AS ingested,
+                    COUNT(*) FILTER (
+                        WHERE COALESCE(auth_required, 'unknown') IN ('yes', 'no')
+                           OR COALESCE(lcd_ncd_citation, '') <> ''
+                    ) AS criteria_applied,
+                    COUNT(*) FILTER (
+                        WHERE COALESCE(jsonb_array_length(COALESCE(evidence_found, '[]'::jsonb)), 0)
+                            + COALESCE(jsonb_array_length(COALESCE(evidence_missing, '[]'::jsonb)), 0) > 0
+                    ) AS evidence_matched,
+                    COUNT(*) FILTER (
+                        WHERE validation_status = 'clean'
+                          AND COALESCE(jsonb_array_length(COALESCE(evidence_missing, '[]'::jsonb)), 0) = 0
+                    ) AS completed
+                FROM prior_auth_contexts
+                WHERE assembled_at::date BETWEEN %s AND %s
+                """,
+                (start, end),
+            )
+            flow_row = cur.fetchone() or {}
+            flow = {
+                "ingested": int(flow_row.get("ingested") or 0),
+                "criteria_applied": int(flow_row.get("criteria_applied") or 0),
+                "evidence_matched": int(flow_row.get("evidence_matched") or 0),
+                "completed": int(flow_row.get("completed") or 0),
+            }
     total = int(counts.get("total_processed") or 0) + quarantined
     clean = int(counts.get("clean") or 0)
     flagged = int(counts.get("flagged") or 0)
@@ -516,6 +551,7 @@ def get_summary(
             ],
             "last_transformation_run": last_run.isoformat() if last_run else None,
             "unreviewed_quarantine": unreviewed,
+            "flow": flow,
         }
     )
 

@@ -43,6 +43,28 @@ _ROOT = Path(__file__).resolve().parent.parent
 UPLOAD_ROOT = _ROOT / "uploads"
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 PEM_RE = re.compile(r"-----BEGIN (?:RSA )?PRIVATE KEY-----")
+COMPLETENESS_RESOURCES = ["ServiceRequest", "DocumentReference", "Patient", "Coverage", "Claim"]
+
+
+def _request_ehr(connector_type: str, display_name: str, documentation_url: str) -> dict[str, Any]:
+    return {
+        "connector_type": connector_type,
+        "display_name": display_name,
+        "category": "ehr",
+        "description": (
+            "Common across RCM client mixes. Live FHIR extract is not wired yet — request this connector "
+            "and use a CSV order extract for that client until it ships."
+        ),
+        "auth_method": "smart_backend_services",
+        "fhir_resources": COMPLETENESS_RESOURCES,
+        "workflows_supported": ["prior_auth_completeness"],
+        "setup_complexity": "complex",
+        "it_required": True,
+        "documentation_url": documentation_url,
+        "required_fields": [],
+        "availability": "request",
+    }
+
 
 CATALOG: list[dict[str, Any]] = [
     {
@@ -51,12 +73,13 @@ CATALOG: list[dict[str, Any]] = [
         "category": "ehr",
         "description": "Connect your Epic EHR instance via FHIR Backend Services API. Requires your IT team to register the app in Epic's developer portal.",
         "auth_method": "smart_backend_services",
-        "fhir_resources": ["ServiceRequest", "DocumentReference", "Patient", "Coverage", "Claim"],
+        "fhir_resources": COMPLETENESS_RESOURCES,
         "workflows_supported": ["prior_auth_completeness"],
         "setup_complexity": "complex",
         "it_required": True,
         "documentation_url": "https://fhir.epic.com/",
         "required_fields": ["epic_client_id", "epic_fhir_base_url", "epic_token_url", "private_key_pem"],
+        "availability": "connect",
     },
     {
         "connector_type": "athena_fhir",
@@ -70,6 +93,7 @@ CATALOG: list[dict[str, Any]] = [
         "it_required": True,
         "documentation_url": "https://docs.athenahealth.com/",
         "required_fields": ["athena_client_id", "athena_client_secret", "athena_practice_id", "athena_fhir_base_url"],
+        "availability": "connect",
     },
     {
         "connector_type": "cerner_fhir",
@@ -77,12 +101,13 @@ CATALOG: list[dict[str, Any]] = [
         "category": "ehr",
         "description": "Connect Oracle Health (Cerner) via SMART Backend Services.",
         "auth_method": "smart_backend_services",
-        "fhir_resources": ["ServiceRequest", "DocumentReference", "Patient", "Coverage", "Claim"],
+        "fhir_resources": COMPLETENESS_RESOURCES,
         "workflows_supported": ["prior_auth_completeness"],
         "setup_complexity": "complex",
         "it_required": True,
         "documentation_url": "https://fhir.cerner.com/",
         "required_fields": ["cerner_client_id", "cerner_fhir_base_url", "private_key_pem"],
+        "availability": "connect",
     },
     {
         "connector_type": "ecw_fhir",
@@ -96,19 +121,26 @@ CATALOG: list[dict[str, Any]] = [
         "it_required": True,
         "documentation_url": "https://fhir.eclinicalworks.com/",
         "required_fields": ["ecw_client_id", "ecw_client_secret", "ecw_fhir_base_url"],
+        "availability": "connect",
     },
+    _request_ehr("nextgen_fhir", "NextGen (FHIR R4)", "https://www.nextgen.com/"),
+    _request_ehr("veradigm_fhir", "Veradigm / Allscripts (FHIR R4)", "https://developer.veradigm.com/"),
+    _request_ehr("meditech_fhir", "MEDITECH (FHIR R4)", "https://fhir.meditech.com/"),
+    _request_ehr("greenway_fhir", "Greenway (FHIR R4)", "https://www.greenwayhealth.com/"),
+    _request_ehr("advancedmd_fhir", "AdvancedMD (FHIR R4)", "https://www.advancedmd.com/"),
     {
         "connector_type": "hapi_fhir",
         "display_name": "HAPI FHIR (sandbox)",
         "category": "ehr",
         "description": "Public HAPI FHIR R4 sandbox. No credentials required. Use this to validate the pipeline before connecting a production EHR.",
         "auth_method": "none",
-        "fhir_resources": ["ServiceRequest", "DocumentReference", "Patient", "Coverage", "Claim"],
+        "fhir_resources": COMPLETENESS_RESOURCES,
         "workflows_supported": ["prior_auth_completeness"],
         "setup_complexity": "simple",
         "it_required": False,
         "documentation_url": "https://hapi.fhir.org/",
         "required_fields": ["base_url"],
+        "availability": "connect",
     },
     {
         "connector_type": "payer_fhir_generic",
@@ -168,7 +200,6 @@ CATALOG_BY_TYPE = {item["connector_type"]: item for item in CATALOG}
 EXTRACTOR_MATCH = {
     "epic_fhir": "%epic%",
     "hapi_fhir": "%hapi%",
-    "cms_bluebutton": "%bluebutton%",
     "athena_fhir": "%athena%",
     "cerner_fhir": "%cerner%",
 }
@@ -231,6 +262,17 @@ def _catalog(connector_type: str) -> dict[str, Any]:
     return item
 
 
+def _assert_connectable(spec: dict[str, Any]) -> None:
+    if spec.get("availability") == "request":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "This EHR is listed for request only. Use a CSV order extract for that client until the live "
+                "extractor ships, or ask Kalamon to prioritize it."
+            ),
+        )
+
+
 def _validate_credentials(connector_type: str, credentials: dict[str, Any]) -> None:
     spec = _catalog(connector_type)
     creds = credentials or {}
@@ -273,7 +315,7 @@ def _friendly_http_error(code: int, connector_type: str) -> dict[str, Any]:
                 "and that the public key on file matches the private key entered here."
                 if code == 401
                 else "Authentication succeeded but required FHIR resources were not granted. Confirm Incoming APIs "
-                "include ExplanationOfBenefit.read, Claim.read, Patient.read, and Coverage.read."
+                "include ServiceRequest.read, DocumentReference.read, Patient.read, Coverage.read, and Claim.read."
             ),
         }
     if code == 404:
@@ -534,6 +576,8 @@ def test_draft_connection(
     user: dict[str, Any] = Depends(require_admin),
 ) -> dict[str, Any]:
     """Live test without persisting credentials."""
+    spec = _catalog(body.connector_type)
+    _assert_connectable(spec)
     _validate_credentials(body.connector_type, body.credentials)
     return run_connection_test(body.connector_type, body.credentials)
 
@@ -545,6 +589,7 @@ def create_connection(
     user: dict[str, Any] = Depends(require_admin),
 ) -> dict[str, Any]:
     spec = _catalog(body.connector_type)
+    _assert_connectable(spec)
     _validate_credentials(body.connector_type, body.credentials)
     client_id = _client_id(user)
     blob = encrypt_secret(json.dumps(body.credentials)) if body.credentials else None

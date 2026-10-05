@@ -516,7 +516,6 @@ def pipeline_health(
                     CASE
                         WHEN position(':' IN extractor_name) > 0
                             THEN split_part(extractor_name, ':', 1)
-                        WHEN extractor_name = 'eob_extractor' THEN 'hapi'
                         ELSE extractor_name
                     END AS source,
                     extractor_name,
@@ -527,6 +526,9 @@ def pipeline_health(
                     records_inserted,
                     error_message
                 FROM extraction_log
+                WHERE extractor_name NOT ILIKE '%eob%'
+                  AND extractor_name NOT ILIKE '%bluebutton%'
+                  AND extractor_name NOT ILIKE '%era%'
             ) runs
             ORDER BY source, completed_at DESC NULLS LAST
             """
@@ -548,7 +550,12 @@ def pipeline_health(
                     "run_duration_seconds": max(0, int(duration)) if duration is not None else None,
                 }
             )
-        cur.execute("SELECT COUNT(*) AS n FROM raw_fhir_responses")
+        cur.execute(
+            """
+            SELECT COUNT(*) AS n FROM raw_fhir_responses
+            WHERE COALESCE(resource_type, '') <> 'ExplanationOfBenefit'
+            """
+        )
         total_raw = int(cur.fetchone()["n"] or 0)
         cur.execute(
             """
@@ -559,11 +566,18 @@ def pipeline_health(
                 COUNT(*) FILTER (
                     WHERE COALESCE(cardinality(data_quality_flags), 0) > 0
                 ) AS total_flagged
-            FROM denial_contexts
+            FROM prior_auth_contexts
             """
         )
         counts = cur.fetchone()
-        cur.execute("SELECT COUNT(*) AS n FROM quarantine_records")
+        cur.execute(
+            """
+            SELECT COUNT(*) AS n
+            FROM quarantine_records
+            WHERE COALESCE(workflow, %s) = %s
+            """,
+            (WORKFLOW_COMPLETENESS, WORKFLOW_COMPLETENESS),
+        )
         total_quarantine = int(cur.fetchone()["n"] or 0)
         cur.execute(
             """
@@ -572,13 +586,15 @@ def pipeline_health(
                 CASE
                     WHEN position(':' IN extractor_name) > 0
                         THEN split_part(extractor_name, ':', 1)
-                    WHEN extractor_name = 'eob_extractor' THEN 'hapi'
                     ELSE extractor_name
                 END AS source,
                 bool_or(status = 'success') AS any_success,
                 bool_or(status = 'failed') AS any_failed
             FROM extraction_log
             WHERE completed_at >= NOW() - INTERVAL '7 days'
+              AND extractor_name NOT ILIKE '%eob%'
+              AND extractor_name NOT ILIKE '%bluebutton%'
+              AND extractor_name NOT ILIKE '%era%'
             GROUP BY 1, 2
             ORDER BY 1
             """
@@ -595,7 +611,15 @@ def pipeline_health(
             }
             for row in cur.fetchall()
         ]
-        cur.execute("SELECT MAX(completed_at) AS last_run_at FROM extraction_log")
+        cur.execute(
+            """
+            SELECT MAX(completed_at) AS last_run_at
+            FROM extraction_log
+            WHERE extractor_name NOT ILIKE '%eob%'
+              AND extractor_name NOT ILIKE '%bluebutton%'
+              AND extractor_name NOT ILIKE '%era%'
+            """
+        )
         last_run = cur.fetchone()["last_run_at"]
 
     now = utcnow()
